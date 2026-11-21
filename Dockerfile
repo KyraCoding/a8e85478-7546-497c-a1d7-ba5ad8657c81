@@ -10,10 +10,22 @@ FROM source AS profiler
 RUN pip install --no-cache-dir pytest==9.2.0 pytest-timeout==2.4.0 duckdb==2.0.0 numpy==2.5.5 pandas==3.1.1 python-dateutil==4.0.0 pytz==2026.6 typing_extensions==4.16.0 psutil==7.2.2 setuptools==84.2.1 setuptools-scm==10.3.4
 WORKDIR /app
 
+FROM source AS native
+COPY native-requirements.txt /tmp/
+RUN python -m pip install --no-cache-dir --require-hashes -r /tmp/native-requirements.txt
+WORKDIR /build
+COPY ast_native.cpp ./
+RUN mkdir /out && if [ "$(uname -m)" = x86_64 ]; then \
+      python -m ziglang c++ -O3 -DNDEBUG -target x86_64-linux-gnu -mcpu=baseline -fPIC -shared -std=c++17 \
+        $(python3-config --includes) ast_native.cpp -o "/out/_ast_native$(python3-config --extension-suffix)"; \
+    fi
+
 FROM profiler AS selector
 WORKDIR /app
 RUN python -m compileall -q -x '/site-packages/' /usr/local/lib/python3.13 /opt/sqlglot/sqlglot /opt/sqlglot/tests
-COPY selector.py map_store.py patches.py schedule.py semantics.py coverage_map.py declarations.py import_effects.py value_profile.py identity_profile.py heavy_profile.py replay.py tc_replay.py state_diff.py fixture_flow.py ./
+COPY selector.py map_store.py patches.py schedule.py semantics.py coverage_map.py source_reader.py default_profile.py declarations.py import_effects.py value_profile.py identity_profile.py heavy_profile.py replay.py tc_replay.py state_diff.py fixture_flow.py ./
+COPY ds_verify.py ds_operations.py ds_origin.py ds_worker.py ds_sites.json.gz ./
 COPY maps/ ./maps/
-RUN python map_store.py
+COPY --from=native /out/ ./
+RUN python map_store.py && python -m compileall -q -l /app
 CMD ["python", "/app/selector.py"]

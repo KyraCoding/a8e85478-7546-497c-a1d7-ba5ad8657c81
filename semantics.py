@@ -3,6 +3,20 @@ import difflib
 from functools import lru_cache
 from types import CodeType
 
+try:
+    import _ast_native
+except ImportError:
+    _ast_native = None
+
+
+def _dump_key(node):
+    if _ast_native is not None:
+        try:
+            return _ast_native.dump(node, ast.AST, "_fields")
+        except (AttributeError, TypeError, ValueError, RecursionError):
+            pass
+    return ast.dump(node)
+
 
 _DEFINITIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 
@@ -117,6 +131,12 @@ def _changed_lines(path, original, patched):
             if a != b:
                 record(a, ancestors, runtime)
             return
+        if _ast_native is not None and isinstance(a, ast.stmt):
+            try:
+                if _ast_native.equal(a, b, ast.AST, "_fields"):
+                    return
+            except (AttributeError, TypeError, ValueError, RecursionError):
+                pass
         parents = ancestors + (a,)
         for field, av in ast.iter_fields(a):
             bv = getattr(b, field)
@@ -139,7 +159,7 @@ def _changed_lines(path, original, patched):
                 record(a, ancestors, body_runtime)
                 continue
             align = difflib.SequenceMatcher(
-                None, [ast.dump(x) for x in av], [ast.dump(x) for x in bv], autojunk=False
+                None, [_dump_key(x) for x in av], [_dump_key(x) for x in bv], autojunk=False
             )
             for tag, i, j, p, q in align.get_opcodes():
                 if tag == "equal":

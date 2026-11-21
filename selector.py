@@ -6,6 +6,8 @@ from pathlib import Path
 
 from coverage_map import Coverage
 from declarations import declaration_candidates
+from default_profile import refine_defaults
+from ds_verify import refine_ds
 from fixture_flow import refine_fixture
 from heavy_profile import refine_heavy
 from identity_profile import refine_identity
@@ -17,6 +19,7 @@ from semantics import semantic_lines
 from state_diff import refine_state
 from tc_replay import refine_tc
 from value_profile import refine
+from source_reader import refine_source_reader
 
 
 def candidates(change, cov, catalog, *, fixtures_only=False):
@@ -74,9 +77,12 @@ def main():
             for change in changes:
                 chosen.update(candidates(change, cov, catalog, fixtures_only=fixtures_only))
             if chosen and time.monotonic() < verify_until:
+                chosen = refine_defaults(changes, chosen, cov, catalog)
                 chosen = refine_state(changes, chosen, cov, catalog)
                 chosen = refine_replay(changes, chosen, cov, catalog)
                 chosen = refine_tc(changes, chosen, cov, catalog)
+                chosen = refine_ds(changes, chosen, cov, catalog, verify_until)
+                chosen = refine_source_reader(changes, chosen, cov, source)
             chosen.update(unseen)
         except (SyntaxError, ValueError, IndexError, KeyError, OSError, RecursionError) as exc:
             print(f"{patch.name}: using full suite ({type(exc).__name__})", file=sys.stderr)

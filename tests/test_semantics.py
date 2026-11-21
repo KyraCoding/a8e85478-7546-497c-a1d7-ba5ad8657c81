@@ -1,11 +1,21 @@
+import ast
 import unittest
 
-from semantics import semantic_lines
+from semantics import _dump_key, semantic_lines
 
 
 class SemanticLinesTests(unittest.TestCase):
     def change(self, source, before, after):
         return semantic_lines("example.py", source, source.replace(before, after), set())
+
+    def test_statement_alignment_keys(self):
+        tree = ast.parse("def f(x=None):\n    return [x, 'é']\n")
+        self.assertEqual(_dump_key(tree), ast.dump(tree))
+        class Custom(ast.AST):
+            _fields = ["value"]
+        node = Custom()
+        node.value = 1
+        self.assertEqual(_dump_key(node), ast.dump(node))
 
     def test_multiline_boolean(self):
         src = "def f(a, b):\n    if (\n        a\n        and b\n    ):\n        return 1\n"
