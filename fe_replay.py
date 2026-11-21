@@ -9,6 +9,7 @@ import struct
 import subprocess
 import sys
 import time
+from bisect import bisect_left
 from functools import lru_cache
 from pathlib import Path
 
@@ -105,40 +106,95 @@ def _expected_cpu(parent, worker):
             + sum(per_query.get(str(index), 0.01) + 0.01 for index in worker))
 
 
-# A changed function-body line that can leave state behind after the call returns: an assignment, augmented
-# assignment, deletion or in-place mutator on a CAPITAL module or class name (directly, through self/cls or through
-# a dotted name), any attribute write through cls or type(self), or setattr/delattr. A global or nonlocal
-# declaration on any changed line counts as well.
-_SHARED_WRITE = re.compile(
-    r"\b(?:setattr|delattr)\s*\("
-    r"|^\s*(?:del\s+)?(?:self\.|cls\.|[A-Za-z_][\w.]*\.)?[A-Z][A-Z0-9_]*(?:\[[^\]]*\])?\s*"
-    r"(?:[-+*/|&]?=(?!=)|\.(?:update|append|extend|insert|pop|popitem|clear|setdefault|add|discard|remove)\s*\()"
-    r"|^\s*(?:del\s+)?(?:cls|type\(self\))\.\w+\s*(?:=(?!=)|\[)"
-)
-_SCOPE = re.compile(r"^\s*(?:global|nonlocal)\b")
+_FUNCTION = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+_MUTATORS = frozenset("""
+    add append appendleft clear difference_update discard extend extendleft insert
+    intersection_update pop popitem popleft remove reverse rotate setdefault sort
+    symmetric_difference_update update __delattr__ __delitem__ __setattr__ __setitem__
+""".split())
 
 
-def _body_lines(text):
-    inside = set()
-    for node in ast.walk(ast.parse(text)):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            first = node.body[0].lineno
-            inside.update(range(first, (node.end_lineno or first) + 1))
-        elif isinstance(node, ast.Lambda):
-            inside.update(range(node.body.lineno, (node.body.end_lineno or node.body.lineno) + 1))
-    return inside
+def _shared_write(tree, rows):
+    if not rows:
+        return False
+    rows = sorted(rows)
+
+    def self_args(node):
+        return (isinstance(node, ast.Attribute) and node.attr == "args"
+                and isinstance(node.value, ast.Name) and node.value.id == "self")
+
+    @lru_cache(None)
+    def bindings(scope):
+        shared = set()
+        args = scope.args.posonlyargs + scope.args.args
+        instance = bool(args and args[0].arg == "self")
+        pending = [scope.body] if isinstance(scope, ast.Lambda) else list(scope.body)
+        while pending:
+            node = pending.pop()
+            if isinstance(node, (ast.Global, ast.Nonlocal)):
+                shared.update(node.names)
+            if isinstance(getattr(node, "ctx", None), (ast.Store, ast.Del)):
+                if (isinstance(node, ast.Name) and node.id == "self") or self_args(node):
+                    instance = False
+            if not isinstance(node, (*_FUNCTION, ast.ClassDef)):
+                pending.extend(ast.iter_child_nodes(node))
+        return shared, instance
+
+    def instance_args(node, scope):
+        return self_args(node) and bindings(scope)[1]
+
+    def shared_target(target, scope):
+        if isinstance(target, (ast.List, ast.Tuple)):
+            return any(shared_target(part, scope) for part in target.elts)
+        if isinstance(target, ast.Starred):
+            return shared_target(target.value, scope)
+        if isinstance(target, ast.Name):
+            return target.id.isupper() or target.id in bindings(scope)[0]
+        # self.args entries belong to the current expression. Other receivers may alias shared objects.
+        owner = target.value if isinstance(target, ast.Subscript) else target
+        return not instance_args(owner, scope)
+
+    def visit(node, scope):
+        if hasattr(node, "lineno"):
+            index = bisect_left(rows, node.lineno)
+            if index == len(rows) or rows[index] > node.end_lineno:
+                return False
+        if isinstance(node, _FUNCTION):
+            body = [node.body] if isinstance(node, ast.Lambda) else node.body
+            return any(visit(stmt, node) for stmt in body)
+        if isinstance(node, ast.ClassDef):
+            scope = None
+        if scope is not None:
+            if isinstance(node, (ast.Global, ast.Nonlocal, ast.AugAssign)):
+                # Augmented assignment can mutate even a plain local name's referent.
+                return True
+            if isinstance(node, (ast.Assign, ast.Delete)):
+                if any(shared_target(target, scope) for target in node.targets):
+                    return True
+            elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
+                if shared_target(node.target, scope):
+                    return True
+            elif isinstance(getattr(node, "ctx", None), (ast.Store, ast.Del)):
+                if shared_target(node, scope):
+                    return True
+            elif isinstance(node, ast.Call):
+                func = node.func
+                name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+                if name in {"setattr", "delattr", "setitem", "delitem"}:
+                    return True
+                if isinstance(func, ast.Attribute) and func.attr in _MUTATORS:
+                    if not instance_args(func.value, scope):
+                        return True
+        return any(visit(child, scope) for child in ast.iter_child_nodes(node))
+
+    return visit(tree, None)
 
 
 def _writes(change):
-    for text, numbers in ((change.patched, change.added), (change.original, change.removed)):
-        source = text.split("\n")
-        body = _body_lines(text)
-        for number in numbers:
-            if 0 < number <= len(source):
-                line = source[number - 1]
-                if _SCOPE.match(line) or (number in body and _SHARED_WRITE.search(line)):
-                    return True
-    return False
+    from semantics import _baseline, patched_tree
+
+    return (_shared_write(patched_tree(change.path, change.patched), change.added)
+            or _shared_write(_baseline(change.path, change.original)[0], change.removed))
 
 
 def _admissible(changes, cov, catalog, consumer):
