@@ -163,6 +163,25 @@ def _index_code(trees, remap):
     return ident_of, code_of, file_of
 
 
+def _has_unmapped_code(changes, sources, remap, base):
+    for change in changes:
+        path = change.path
+        if path not in sources or change.patched != sources[path]:
+            continue
+        lines = change.patched.split("\n")
+        added = (lines[n - 1] for n in change.added if 0 < n <= len(lines))
+        if not any("def " in line or "lambda" in line or " for " in line or line.lstrip().startswith("@")
+                   for line in added):
+            continue
+        module = path[:-3].replace("/", ".").removesuffix(".__init__")
+        top = compile(sources[path].encode("utf-8"), path, "exec", dont_inherit=True)
+        _, codes, _ = _index_code({module: (path, top)}, remap)
+        for ident in codes.keys() - base["code"].get(path, {}).keys():
+            if ident not in base["extents"] and not any(ident in other for other in base["code"].values()):
+                return True
+    return False
+
+
 def _code_extent(code):
     import dis
     from types import CodeType
@@ -721,6 +740,8 @@ class PatchState:
         if self.deadline is not None:
             budget = min(budget, self.deadline - time.monotonic())
         if budget < 3:
+            return None
+        if _has_unmapped_code(self.changes, sources, remap, base):
             return None
         start = time.monotonic()
         got = _run_child({"root": str(self.root), "sources": sources, "remap": remap, "loose": base["loose"],
