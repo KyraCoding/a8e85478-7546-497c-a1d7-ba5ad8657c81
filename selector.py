@@ -24,7 +24,7 @@ from patches import read_changes
 from registry_context import registry_context_required
 from replay import refine_replay
 from schedule import SpareCapacity, distribute
-from semantics import generator_initialization_changed, semantic_lines
+from semantics import order_sensitive_change, semantic_lines
 from state_diff import refine_state
 from tc_replay import refine_tc
 from value_profile import refine
@@ -99,7 +99,7 @@ def main():
             changes = read_changes(text, source)
             state = PatchState(changes, source, verify_until, seconds)
             proof_context = changes if time.monotonic() < verify_until else None
-            ordered = any(generator_initialization_changed(c, proof_context) or expression_contract_narrowed(c, state)
+            ordered = any(order_sensitive_change(c, proof_context) or expression_contract_narrowed(c, state)
                           for c in changes)
             if ordered:
                 chosen = set(catalog)

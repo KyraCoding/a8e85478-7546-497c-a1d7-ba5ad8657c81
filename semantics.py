@@ -703,6 +703,16 @@ def _inert_skip(tree, kinds):
     return skip
 
 
+def order_sensitive_change(change, changes=None):
+    path = change.path
+    if path == "sqlglot/parser.py" or (path.startswith("sqlglot/parsers/") and path.endswith(".py")):
+        # A callback may mutate a shared parser table when one test invokes it. Later
+        # tests can observe that mutation even when they never use the same dialect.
+        original = _baseline(path, change.original)[0]
+        return _shared_scopes_differ(change, original, patched_tree(path, change.patched))
+    return generator_initialization_changed(change, changes)
+
+
 def generator_initialization_changed(change, changes=None):
     """True when a generator module's definition-time effects differ, or a changed scope may write shared state.
     Given the whole patch (`changes`), inert calls (see _inert_skip and _inert_kinds) are left out of the effect

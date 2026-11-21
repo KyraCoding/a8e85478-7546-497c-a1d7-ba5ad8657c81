@@ -4,7 +4,7 @@ import unittest
 import weakref
 
 from patches import Change
-from semantics import _dump_key, _patched, generator_initialization_changed, patched_code, semantic_lines
+from semantics import _dump_key, _patched, generator_initialization_changed, order_sensitive_change, patched_code, semantic_lines
 
 
 class SemanticLinesTests(unittest.TestCase):
@@ -68,6 +68,19 @@ class SemanticLinesTests(unittest.TestCase):
         finally:
             if enabled:
                 gc.enable()
+
+
+class ParserSharedStateTests(unittest.TestCase):
+    def test_dispatch_table_can_write_into_another_parsers_registry(self):
+        original = "from example import Base\nclass Dialect(Base):\n    FUNCTIONS = {'key': lambda x: x}\n"
+        for path in ("sqlglot/parser.py", "sqlglot/parsers/example.py"):
+            for value in ("Base.FUNCTIONS.setdefault('k', fn)", "lambda x: Base.FUNCTIONS.update(x)"):
+                after = original.replace("lambda x: x", value)
+                with self.subTest(path=path, value=value):
+                    self.assertTrue(order_sensitive_change(Change(path, original, after, {3}, {3})))
+                    self.assertTrue(order_sensitive_change(Change(path, after, original, {3}, {3})))
+            after = original.replace("lambda x: x", "lambda x: make(x)")
+            self.assertFalse(order_sensitive_change(Change(path, original, after, {3}, {3})))
 
 
 class GeneratorDefaultsTests(unittest.TestCase):
