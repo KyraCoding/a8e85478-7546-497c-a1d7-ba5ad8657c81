@@ -85,11 +85,15 @@ def main():
                 for change in changes:
                     chosen.update(candidates(change, cov, catalog, fixtures_only=fixtures_only))
                 if chosen and time.monotonic() < verify_until:
+                    frontend_allowed = not chosen.issuperset(catalog)
                     chosen = refine_defaults(changes, chosen, cov, catalog)
                     chosen = refine_state(changes, chosen, cov, catalog)
                     chosen = refine_replay(changes, chosen, cov, catalog)
                     chosen = refine_tc(changes, chosen, cov, catalog)
                     chosen = refine_ds(changes, chosen, cov, catalog, verify_until)
+                    if frontend_allowed and not chosen.issuperset(catalog):
+                        from fe_replay import refine_frontend
+                        chosen = refine_frontend(changes, chosen, cov, catalog, verify_until)
                     chosen = refine_source_reader(changes, chosen, cov, source)
             chosen.update(unseen)
         except (SyntaxError, ValueError, IndexError, KeyError, OSError, RecursionError) as exc:
