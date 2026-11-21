@@ -114,16 +114,13 @@ def _admissible(changes, cov, catalog, consumer):
         if change.structural:
             return "structural change"
         if not path.endswith(".py"):
-            if not path.startswith("tests/fixtures/"):
-                return "non-fixture edit"
+            directory, _, name = path.rpartition("/")
+            if directory != "tests/fixtures/optimizer" or not name.endswith(".sql"):
+                return "unsupported fixture edit"
             readers = cov.fixture(path)
-            if readers:
-                if DS in readers:
-                    return "edits a file the test reads"
-                continue
-            if path.startswith(("docs/", ".github/")) or path.endswith(".md"):
-                continue
-            return "unknown non-python file"
+            if not readers or DS in readers:
+                return "fixture reads overlap or are unknown"
+            continue
         if not path.startswith("sqlglot/"):
             return "python edit outside sqlglot"
         lines = semantic_lines(path, change.original, change.patched, change.removed)
@@ -177,6 +174,11 @@ def _replay(request, limit):
             except ProcessLookupError:
                 pass
             proc.wait()
+            while True:
+                try:
+                    os.waitpid(-proc.pid, 0)
+                except ChildProcessError:
+                    break
             if sys.exc_info()[0] is subprocess.TimeoutExpired:
                 return "timeout"
             raise
