@@ -329,7 +329,7 @@ def _partial_context(changes, chosen, numbers, millis, tests):
 
 def _prepare(changes, chosen, cov, numbers):
     from import_effects import _index
-    from semantics import semantic_lines
+    from semantics import patched_code, semantic_lines
     modules = []
     need_line = set()
     for change in changes:
@@ -357,7 +357,7 @@ def _prepare(changes, chosen, cov, numbers):
             import_lines = _index()[0].get(path, {})
             if any(import_lines.get(str(n)) for n in lines):
                 must = None
-        code = compile(change.patched.encode("utf-8"), path, "exec", dont_inherit=True)
+        code = patched_code(path, change.patched)
         modules.append((name, os.path.join(ROOT, path), is_pkg, marshal.dumps(code),
                         change.patched.encode("utf-8"), targets, bool(lines != set()), must))
     if not modules or not any(m[6] for m in modules):

@@ -174,7 +174,9 @@ def _has_unmapped_code(changes, sources, remap, base):
                    for line in added):
             continue
         module = path[:-3].replace("/", ".").removesuffix(".__init__")
-        top = compile(sources[path].encode("utf-8"), path, "exec", dont_inherit=True)
+        from semantics import patched_code
+
+        top = patched_code(path, sources[path])
         _, codes, _ = _index_code({module: (path, top)}, remap)
         for ident in codes.keys() - base["code"].get(path, {}).keys():
             if ident not in base["extents"] and not any(ident in other for other in base["code"].values()):
@@ -909,6 +911,7 @@ if __name__ == "__main__":
             except BaseException:
                 raise SystemExit(1)
             protocol.write(marshal.dumps(payload))
-        raise SystemExit(79)
+        # The protocol stream is closed and complete; skip interpreter teardown of the imported package.
+        os._exit(79)
     if sys.argv[1:2] == ["--record"]:
         record(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else MAP)

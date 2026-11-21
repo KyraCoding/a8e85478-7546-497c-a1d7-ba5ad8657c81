@@ -1,3 +1,10 @@
+if __name__ == "__main__":
+    # The selector process is short-lived and its large maps and syntax trees are acyclic, so
+    # reference counting frees its garbage; cyclic collection would only re-scan them.
+    import gc
+
+    gc.disable()
+
 import json
 import os
 import sys
@@ -124,3 +131,11 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # Leave without tearing down every map, cache and syntax tree object by object. Exit handlers (the
+    # check-run client's shutdown) run first, and both output streams are flushed, as at a normal exit.
+    import atexit
+
+    atexit._run_exitfuncs()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

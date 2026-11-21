@@ -7,8 +7,8 @@ import sys
 from pathlib import Path
 
 from coverage_map import Coverage
-from declarations import _lookup_index
 from expression_additions import PROFILE, REGISTRIES
+from map_store import MAPS, read_map
 
 
 def _opaque(node, path):
@@ -40,7 +40,11 @@ def record(root):
     from sqlglot.parser import Parser
 
     cov = Coverage()
-    tests, lookup, aliases, _ = _lookup_index()
+    # Generation inspects every row. The selector can keep its on-demand table.
+    data = read_map(MAPS / "declarations-lookups.json.gz")
+    tests = data["tests"]
+    lookup = {tuple(row[:-1]): row[-1] for row in data["records"]}
+    aliases = {(a, b): (c, d) for a, b, c, d in data.get("aliases", ())}
     opaque = set()
     reserved = {name.lower() for name in (*vars(exp), *vars(builtins))} | set(exp.EXPR_CLASSES)
     functions = set(exp.FUNCTION_BY_NAME)

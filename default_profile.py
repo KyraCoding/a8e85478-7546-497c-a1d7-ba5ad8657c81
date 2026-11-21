@@ -3,7 +3,7 @@ import hashlib
 
 from import_effects import import_consumers
 from map_store import MAPS, read_map
-from semantics import patched_tree
+from semantics import patched_code
 
 
 @cache
@@ -49,7 +49,7 @@ def _body(change):
         previous = _literal(old[start:end])
         edited = _literal(new[start:new_end])
         if previous is not None and type(previous) is type(edited) and previous != edited:
-            compile(patched_tree(change.path, change.patched), change.path, "exec", dont_inherit=True)
+            patched_code(change.path, change.patched)
             return set(range(first, last + 1))
     return None
 

@@ -1,7 +1,9 @@
 import ast
+import gc
 import unittest
+import weakref
 
-from semantics import _dump_key, semantic_lines
+from semantics import _dump_key, _patched, patched_code, semantic_lines
 
 
 class SemanticLinesTests(unittest.TestCase):
@@ -43,3 +45,25 @@ class SemanticLinesTests(unittest.TestCase):
         src = "# coding: utf-8\ndef f():\n    return 'café'\n"
         self.assertIsNone(self.change(src, "utf-8", "ascii"))
         self.assertEqual(self.change(src, "utf-8", "latin-1"), {3})
+
+    def test_invalid_compile_does_not_keep_input_after_eviction(self):
+        class Source(str):
+            pass
+
+        def invalid(i):
+            source = Source(f"x = {i}\nreturn x\n")
+            try:
+                patched_code("example.py", source)
+            except SyntaxError:
+                return weakref.ref(source)
+            self.fail("expected a module-level return to fail compilation")
+
+        enabled = gc.isenabled()
+        gc.disable()
+        try:
+            refs = [invalid(i) for i in range(12)]
+            _patched.cache_clear()
+            self.assertTrue(all(ref() is None for ref in refs))
+        finally:
+            if enabled:
+                gc.enable()

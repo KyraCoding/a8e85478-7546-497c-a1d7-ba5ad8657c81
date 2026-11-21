@@ -1,6 +1,9 @@
 import ast
 import difflib
+import marshal
+import os
 from functools import lru_cache
+from importlib.util import MAGIC_NUMBER, cache_from_source
 from types import CodeType
 
 try:
@@ -32,10 +35,37 @@ def _without_positions(code):
     )
 
 
+def _pinned_code(path, data):
+    """Bytecode the image compiled from exactly these source bytes, or None.
+
+    compileall used the same flags as compile(..., "exec", dont_inherit=True); a timestamp .pyc whose
+    recorded mtime and size match the unchanged file, holding these exact bytes, is that compilation.
+    """
+    try:
+        file = os.path.join(os.environ.get("SQLGLOT_ROOT", "/opt/sqlglot"), *path.split("/"))
+        with open(file, "rb") as stream:
+            if stream.read() != data:
+                return None
+            stat = os.fstat(stream.fileno())
+        with open(cache_from_source(file), "rb") as stream:
+            pyc = stream.read()
+        if (pyc[:4] != MAGIC_NUMBER or pyc[4:8] != b"\0\0\0\0"
+                or int.from_bytes(pyc[8:12], "little") != int(stat.st_mtime) & 0xFFFFFFFF
+                or int.from_bytes(pyc[12:16], "little") != stat.st_size & 0xFFFFFFFF):
+            return None
+        code = marshal.loads(pyc[16:])
+    except (OSError, ValueError, EOFError, TypeError, NotImplementedError):
+        return None
+    return code if type(code) is CodeType else None
+
+
 @lru_cache(maxsize=6)
 def _baseline(path, source):
-    tree = ast.parse(source.encode("utf-8"), path)
-    code = compile(tree, path, "exec", dont_inherit=True)
+    data = source.encode("utf-8")
+    tree = ast.parse(data, path)
+    code = _pinned_code(path, data)
+    if code is None:
+        code = compile(tree, path, "exec", dont_inherit=True)
     lines = set()
 
     def collect(block):
@@ -48,9 +78,29 @@ def _baseline(path, source):
     return tree, _without_positions(code), lines
 
 
-@lru_cache(maxsize=1)
+@lru_cache(maxsize=4)
+def _patched(path, source):
+    tree = ast.parse(source.encode("utf-8"), path)
+    # Compile before any caller can see the tree, so later edits to it cannot leak into the code.
+    try:
+        code = compile(tree, path, "exec", dont_inherit=True)
+    except Exception as exc:
+        # Drop the traceback: its frame holds the tree, and this process runs without cyclic collection.
+        code = exc.with_traceback(None)
+    return tree, code
+
+
 def patched_tree(path, source):
-    return ast.parse(source.encode("utf-8"), path)
+    return _patched(path, source)[0]
+
+
+def patched_code(path, source):
+    """compile(source.encode("utf-8"), path, "exec", dont_inherit=True), shared by every stage of a patch."""
+    code = _patched(path, source)[1]
+    if isinstance(code, BaseException):
+        # Raising the cached instance would attach this frame to it again.
+        raise type(code)(*code.args)
+    return code
 
 
 def _entry(node):
@@ -84,12 +134,12 @@ def semantic_lines(path: str, original: str, patched: str, old_lines: set[int]) 
     return None if lines is None else lines.copy()
 
 
-@lru_cache(maxsize=1)
+@lru_cache(maxsize=16)
 def _changed_lines(path, original, patched):
     try:
         old, compiled_old, executable = _baseline(path, original)
         new = patched_tree(path, patched)
-        compiled_new = compile(new, path, "exec", dont_inherit=True)
+        compiled_new = patched_code(path, patched)
     except (SyntaxError, ValueError, RecursionError):
         return None
     if compiled_old == _without_positions(compiled_new):

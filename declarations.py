@@ -6,14 +6,19 @@ from collections import defaultdict
 from functools import cache
 from pathlib import Path
 
-from map_store import read_map
+from map_store import read_grouped, read_map
 from semantics import _baseline, patched_tree
 
 
 @cache
 def _index():
     path = Path(__file__).resolve().parent / "maps" / "declarations.json.gz"
-    data = read_map(path)
+    grouped = read_grouped(path)
+    if grouped is not None:
+        data, records = grouped
+    else:
+        data = read_map(path)
+        records = {tuple(row[:-1]): row[-1] for row in data["records"]}
     descendants = defaultdict(set)
     for child, bases in data["parents"].items():
         for base in bases:
@@ -21,7 +26,6 @@ def _index():
     copies = defaultdict(set)
     for src, attr, dst in data.get("copies", ()):
         copies[src, attr].add(dst)
-    records = {tuple(row[:-1]): row[-1] for row in data["records"]}
     return descendants, records, data["tests"], set(data["cached"]), copies
 
 
@@ -46,10 +50,15 @@ def _key(node):
 @cache
 def _lookup_index():
     folder = Path(__file__).resolve().parent / "maps"
-    data = read_map(folder / "declarations-lookups.json.gz")
+    grouped = read_grouped(folder / "declarations-lookups.json.gz")
+    if grouped is not None:
+        data, records = grouped
+    else:
+        data = read_map(folder / "declarations-lookups.json.gz")
+        records = {tuple(r[:-1]): r[-1] for r in data["records"]}
     access = read_map(folder / "declarations-access.json.gz")
     aliases = {(a, b): (c, d) for a, b, c, d in data.get("aliases", ())}
-    return data["tests"], {tuple(r[:-1]): r[-1] for r in data["records"]}, aliases, access
+    return data["tests"], records, aliases, access
 
 
 def _safe_reference(node, known, symbols):
