@@ -47,7 +47,8 @@ def candidates(change, cov, catalog, *, fixtures_only=False, state=None, tests_b
         return catalog
     if lines is None:
         try:
-            result = declaration_candidates(path, change.original, change.patched, change.removed, cov)
+            result = declaration_candidates(path, change.original, change.patched, change.removed, cov,
+                                            single_change=state is not None and len(state.changes) == 1)
         except SyntaxError:
             result = None
         if result is None:

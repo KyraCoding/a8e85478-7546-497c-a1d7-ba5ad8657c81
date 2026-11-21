@@ -270,10 +270,126 @@ def _mask_values(scope, changed):
     return result
 
 
-def declaration_candidates(path, original, patched, old_lines, cov):
+@cache
+def _private_name_unused(root, path, name):
+    if not (root / path).is_file() or not (root / "tests").is_dir():
+        return False
+    token = name.encode()
+    for folder in ("sqlglot", "tests"):
+        for file in (root / folder).rglob("*.py"):
+            source = file.read_bytes()
+            if token not in source:
+                continue
+            if file == root / path:
+                return False
+            tree = ast.parse(source)
+            # An unrelated class may own a private method with the same spelling.
+            for cls in (stmt for stmt in tree.body if isinstance(stmt, ast.ClassDef)):
+                if any(isinstance(stmt, ast.FunctionDef) and stmt.name == name for stmt in cls.body):
+                    for node in ast.walk(cls):
+                        if isinstance(node, ast.FunctionDef) and node.name == name:
+                            node.name = "_unrelated"
+                        if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                                and node.value.id == "self" and node.attr == name):
+                            node.attr = "_unrelated"
+            if name in ast.unparse(tree):
+                return False
+    return True
+
+
+def _private_transform_helper(path, old, new, root, cov):
+    if not path.startswith("sqlglot/generators/"):
+        return None
+    existing = {node.name for node in old.body if isinstance(node, ast.FunctionDef)}
+    helpers = [node for node in new.body if isinstance(node, ast.FunctionDef) and node.name not in existing]
+    if len(helpers) != 1:
+        return None
+    helper, = helpers
+    if (not re.fullmatch(r"_[a-z][a-z0-9_]*", helper.name) or helper.decorator_list or helper.args.defaults
+            or any(helper.args.kw_defaults) or helper.type_params
+            or not any(isinstance(stmt, ast.ImportFrom) and stmt.module == "__future__"
+                       and any(name.name == "annotations" for name in stmt.names) for stmt in old.body)):
+        return None
+    if ([v.arg for v in (*helper.args.posonlyargs, *helper.args.args)] != ["self", "expression"]
+            or helper.args.kwonlyargs or helper.args.vararg or helper.args.kwarg):
+        return None
+    allowed_calls = {"self.func", "expression.sql_name", "expression.args.get", "exp.If", "exp.Literal.number"}
+    body = ast.Module(helper.body, [])
+    allowed = (ast.Module, ast.If, ast.Return, ast.Assign, ast.Name, ast.Load, ast.Store, ast.Attribute,
+               ast.Constant, ast.Call, ast.keyword, ast.Compare, ast.Lt)
+    locals_ = {n.id for n in ast.walk(body) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    if locals_ & {"self", "expression", "exp"}:
+        return None
+    for node in ast.walk(body):
+        if not isinstance(node, allowed):
+            return None
+        if isinstance(node, ast.Name) and node.id not in locals_ | {"self", "expression", "exp"}:
+            return None
+        if isinstance(node, ast.Attribute) and (not isinstance(node.ctx, ast.Load) or node.attr.startswith("__")):
+            return None
+        if isinstance(node, ast.Call) and ast.unparse(node.func) not in allowed_calls:
+            return None
+    # A newly visible private name must have no other pre-existing consumer in the checkout.
+    if not _private_name_unused(root, path, helper.name):
+        return None
+    replacements = []
+    for cls in new.body:
+        if not isinstance(cls, ast.ClassDef) or helper.lineno >= cls.lineno:
+            continue
+        for stmt in cls.body:
+            if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name) and stmt.targets[0].id == "TRANSFORMS"
+                    and isinstance(stmt.value, ast.Dict)):
+                continue
+            for i, (key, value) in enumerate(zip(stmt.value.keys, stmt.value.values)):
+                if isinstance(value, ast.Name) and value.id == helper.name:
+                    if not (isinstance(key, ast.Attribute) and isinstance(key.value, ast.Name) and key.value.id == "exp"):
+                        return None
+                    replacements.append((cls.name, stmt.value, i, key.attr))
+    if not replacements:
+        return None
+    owners = {owner for owner, table, index, key in replacements}
+    if len(owners) != 1:
+        return None
+    compile(new, path, "exec", dont_inherit=True)
+    for _, table, i, _ in reversed(replacements):
+        del table.keys[i], table.values[i]
+    new.body.remove(helper)
+    if ast.dump(old) != ast.dump(new):
+        return None
+    # The lookup profiler records a class by its real name, not by the spelling of an alias.
+    try:
+        from sqlglot import exp
+    except ImportError:
+        return None
+    for _, _, _, key in replacements:
+        expression = vars(exp).get(key)
+        if not isinstance(expression, type) or not issubclass(expression, exp.Expr) or expression.__name__ != key:
+            return None
+    module = path[:-3].replace("/", ".")
+    cls = module + "." + owners.pop()
+    descendants, _, _, _, copies = _index()
+    impacted = descendants.get(cls)
+    if not impacted or any(copies.get((owner, "TRANSFORMS")) for owner in impacted):
+        return None
+    _, records, aliases, _ = _lookup_index()
+    if any((*aliases.get((owner, "TRANSFORMS"), (owner, "TRANSFORMS")), "*") not in records for owner in impacted):
+        return None
+    keys = {"member:" + key for _, _, _, key in replacements}
+    return _lookup_candidates(cls, "TRANSFORMS", impacted, keys, True, module, cov)
+
+
+def declaration_candidates(path, original, patched, old_lines, cov, *, single_change=False):
     if not path.startswith("sqlglot/"):
         return None
     old, new = _declaration_trees(path, original, patched)
+    if single_change and path.startswith("sqlglot/generators/") and len(new.body) == len(old.body) + 1:
+        # The projection removes AST nodes. Preserve both cached trees for later stages and patches.
+        result = _private_transform_helper(
+            path, old, ast.parse(patched), Path(os.environ.get("SQLGLOT_ROOT", "/opt/sqlglot")), cov
+        )
+        if isinstance(result, set):
+            return result | cov.missing
     module = path[:-3].replace("/", ".").removesuffix(".__init__")
     left = list(_declarations(old, module))
     right = list(_declarations(new, module))
