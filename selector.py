@@ -129,3 +129,11 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # Leave without tearing down every map, cache and syntax tree object by object. Exit handlers (the
+    # check-run client's shutdown) run first, and both output streams are flushed, as at a normal exit.
+    import atexit
+
+    atexit._run_exitfuncs()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

@@ -911,6 +911,7 @@ if __name__ == "__main__":
             except BaseException:
                 raise SystemExit(1)
             protocol.write(marshal.dumps(payload))
-        raise SystemExit(79)
+        # The protocol stream is closed and complete; skip interpreter teardown of the imported package.
+        os._exit(79)
     if sys.argv[1:2] == ["--record"]:
         record(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else MAP)
