@@ -1,7 +1,9 @@
+import ast
 import gzip
 import hashlib
 import json
 import os
+import re
 import signal
 import struct
 import subprocess
@@ -103,11 +105,47 @@ def _expected_cpu(parent, worker):
             + sum(per_query.get(str(index), 0.01) + 0.01 for index in worker))
 
 
+# A changed function-body line that can leave state behind after the call returns: an assignment, augmented
+# assignment, deletion or in-place mutator on a CAPITAL module or class name (directly, through self/cls or through
+# a dotted name), any attribute write through cls or type(self), or setattr/delattr. A global or nonlocal
+# declaration on any changed line counts as well.
+_SHARED_WRITE = re.compile(
+    r"\b(?:setattr|delattr)\s*\("
+    r"|^\s*(?:del\s+)?(?:self\.|cls\.|[A-Za-z_][\w.]*\.)?[A-Z][A-Z0-9_]*(?:\[[^\]]*\])?\s*"
+    r"(?:[-+*/|&]?=(?!=)|\.(?:update|append|extend|insert|pop|popitem|clear|setdefault|add|discard|remove)\s*\()"
+    r"|^\s*(?:del\s+)?(?:cls|type\(self\))\.\w+\s*(?:=(?!=)|\[)"
+)
+_SCOPE = re.compile(r"^\s*(?:global|nonlocal)\b")
+
+
+def _body_lines(text):
+    inside = set()
+    for node in ast.walk(ast.parse(text)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            first = node.body[0].lineno
+            inside.update(range(first, (node.end_lineno or first) + 1))
+        elif isinstance(node, ast.Lambda):
+            inside.update(range(node.body.lineno, (node.body.end_lineno or node.body.lineno) + 1))
+    return inside
+
+
+def _writes(change):
+    for text, numbers in ((change.patched, change.added), (change.original, change.removed)):
+        source = text.split("\n")
+        body = _body_lines(text)
+        for number in numbers:
+            if 0 < number <= len(source):
+                line = source[number - 1]
+                if _SCOPE.match(line) or (number in body and _SHARED_WRITE.search(line)):
+                    return True
+    return False
+
+
 def _admissible(changes, cov, catalog, consumer):
     from import_effects import import_consumers
     from semantics import semantic_lines
 
-    from fe_fence import single_replacement, trivia_only
+    from fe_fence import trivia_only
 
     if len({change.path for change in changes}) != len(changes):
         return "repeated file"
@@ -133,12 +171,12 @@ def _admissible(changes, cov, catalog, consumer):
             if not trivia_only(change):
                 return "nontrivial additional source"
             continue
+        if _writes(change):
+            return "edit writes shared state"
         if set(lines).intersection(consumer.get(path, ())):
             return "changed line runs on the execution side"
         if import_consumers(path, lines, cov, catalog):
             return "changed line runs during import"
-        if sources or not single_replacement(change):
-            return "outside single replacement"
         sources[path] = change.patched
         changed[path] = set(lines)
     return (sources, changed) if sources else "no executable edit"
