@@ -10,6 +10,7 @@ RESET = "tests/test_dialect_entry_points.py"
 PINS = {
     DIALECT: "76e8553773db08405642d8ea65cd680322d94a7f1a94b2efdba4015728116bda",
     INDEX: "0769ac3b1bec8cacf5a24c63b3049271d0907e20bba94a2475bbcfdeac329ae9",
+    "sqlglot/optimizer/__init__.py": "ad220f0033d3761d67d8048c8b4a730fb1ce47923e88c6bbe236b41067b83a82",
     RESET: "d16d3f02bc635f57d284ef9e3cec350b5e7b1ca46f4122c921fc57eb239bbe3e",
 }
 METHODS = {"get", "get_or_raise", "_try_load"}
