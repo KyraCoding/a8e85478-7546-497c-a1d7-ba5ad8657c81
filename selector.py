@@ -13,8 +13,9 @@ from heavy_profile import refine_heavy
 from identity_profile import refine_identity
 from import_effects import import_consumers, module_fallback
 from patches import read_changes
+from registry_context import registry_context_required
 from replay import refine_replay
-from schedule import distribute
+from schedule import SpareCapacity, distribute
 from semantics import semantic_lines
 from state_diff import refine_state
 from tc_replay import refine_tc
@@ -68,26 +69,35 @@ def main():
     catalog = set(numbers)
     cov = Coverage()
     unseen = catalog.difference(cov.nodes)
+    patches = sorted((data / "commits").glob("*.patch"))
+    catalog_bytes = sum(len(str(number)) + 1 for number in millis)
+    max_output = sum(len(json.dumps(p.stem)) + catalog_bytes + 50 for p in patches)
+    padding = SpareCapacity(millis) if max_output <= 2_000_000 else None
     verify_until = time.monotonic() + 85
-    for patch in sorted((data / "commits").glob("*.patch")):
+    for patch in patches:
         try:
             changes = read_changes(patch.read_text(encoding="utf-8"), source)
-            chosen = set()
-            fixtures_only = all(c.path.startswith("tests/fixtures/") and not c.structural for c in changes)
-            for change in changes:
-                chosen.update(candidates(change, cov, catalog, fixtures_only=fixtures_only))
-            if chosen and time.monotonic() < verify_until:
-                chosen = refine_defaults(changes, chosen, cov, catalog)
-                chosen = refine_state(changes, chosen, cov, catalog)
-                chosen = refine_replay(changes, chosen, cov, catalog)
-                chosen = refine_tc(changes, chosen, cov, catalog)
-                chosen = refine_ds(changes, chosen, cov, catalog, verify_until)
-                chosen = refine_source_reader(changes, chosen, cov, source)
+            if registry_context_required(changes):
+                chosen = set(catalog)
+            else:
+                chosen = set()
+                fixtures_only = all(c.path.startswith("tests/fixtures/") and not c.structural for c in changes)
+                for change in changes:
+                    chosen.update(candidates(change, cov, catalog, fixtures_only=fixtures_only))
+                if chosen and time.monotonic() < verify_until:
+                    chosen = refine_defaults(changes, chosen, cov, catalog)
+                    chosen = refine_state(changes, chosen, cov, catalog)
+                    chosen = refine_replay(changes, chosen, cov, catalog)
+                    chosen = refine_tc(changes, chosen, cov, catalog)
+                    chosen = refine_ds(changes, chosen, cov, catalog, verify_until)
+                    chosen = refine_source_reader(changes, chosen, cov, source)
             chosen.update(unseen)
         except (SyntaxError, ValueError, IndexError, KeyError, OSError, RecursionError) as exc:
             print(f"{patch.name}: using full suite ({type(exc).__name__})", file=sys.stderr)
             chosen = catalog
         workers = distribute((numbers[node] for node in chosen & catalog), millis)
+        if padding is not None:
+            workers = padding.fill(workers)
         print(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
 
 

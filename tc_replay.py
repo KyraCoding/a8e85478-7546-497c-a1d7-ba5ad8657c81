@@ -49,7 +49,7 @@ def boundary_hashes(root):
 @lru_cache(maxsize=1)
 def profile():
     data = read_map(MAP)
-    if data["version"] != 1:
+    if data["version"] != 2:
         raise ValueError("unsupported TPC map")
     return data
 
@@ -262,6 +262,7 @@ def _child(request):
     import resource
     import signal
     import time
+    import unittest
     resource.setrlimit(resource.RLIMIT_CPU, (3, 3))
     root = Path(os.environ.get("SQLGLOT_ROOT", "/opt/sqlglot")).resolve()
     sys.path.insert(0, str(root))

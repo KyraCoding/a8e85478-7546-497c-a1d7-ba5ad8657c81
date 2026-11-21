@@ -60,7 +60,7 @@ def refine_defaults(changes, chosen, cov, catalog):
     change = changes[0]
     try:
         body = _body(change)
-        if not body or not cov.present(change.path) or not any(cov.has_line(change.path, n) for n in body):
+        if not body or not cov.present(change.path):
             return chosen
         consumers = import_consumers(change.path, body | change.removed, cov, catalog)
         return cov.lines(change.path, body) | consumers | cov.fixture(change.path) | cov.missing | (catalog - set(cov.nodes))

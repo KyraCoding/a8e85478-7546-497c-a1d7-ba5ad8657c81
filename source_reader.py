@@ -73,6 +73,24 @@ def verify_file():
         raise SystemExit(2)
     sys.path.insert(0, str(root))
     suite = unittest.defaultTestLoader.loadTestsFromName(METHOD)
+    case, = suite
+    test_code = getattr(case, METHOD.rsplit(".", 1)[1]).__code__
+    read_code = Path.read_text.__code__
+    edited = source.resolve()
+    pinned = Path(os.environ.get("SQLGLOT_ROOT", "/opt/sqlglot")).resolve() / path
+    reads = set()
+
+    def observe(event, args):
+        if event != "open" or not isinstance(args[0], str) or not args[0].endswith(path.name):
+            return
+        frame = sys._getframe(1)
+        while frame is not None:
+            if frame.f_code is read_code and frame.f_back is not None and frame.f_back.f_code is test_code:
+                reads.add(Path(args[0]).resolve())
+                return
+            frame = frame.f_back
+
+    sys.addaudithook(observe)
 
     class Outcome(unittest.TestResult):
         verified = False
@@ -84,7 +102,7 @@ def verify_file():
     result = suite.run(Outcome())
     mod = importlib.import_module(".".join((*path.parts[:2], path.stem)))
     if (Path(mod.__file__).resolve() != source.resolve() or not result.wasSuccessful()
-            or not result.verified or result.testsRun != 1):
+            or not result.verified or result.testsRun != 1 or edited not in reads or pinned in reads):
         raise SystemExit(1)
     print("verified")
 

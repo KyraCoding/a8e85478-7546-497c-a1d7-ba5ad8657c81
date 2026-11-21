@@ -112,6 +112,8 @@ def main():
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--file")
+    parser.add_argument("--site-profile", choices=("clean", "pytest"))
+    parser.add_argument("--update-sites", type=Path, help="preserve the existing validated test footprints and union sites")
     parser.add_argument("--jobs", type=int, default=2)
     args = parser.parse_args()
     root, dest = args.source.resolve(), args.output.resolve()
@@ -122,7 +124,27 @@ def main():
     if args.file:
         test_footprint(args.file, dest)
         return
-    data = {"sites": import_sites(root), "tests": {}}
+    if args.site_profile:
+        if args.site_profile == "pytest":
+            import pytest
+        elif "unittest" in sys.modules or "pytest" in sys.modules:
+            raise RuntimeError("clean import process already contains a test runner")
+        if any(name == "sqlglot" or name.startswith("sqlglot.") for name in sys.modules):
+            raise RuntimeError("SQLGlot imported before profiling")
+        sites = import_sites(root)
+        if sys.modules["sqlglot.expressions.core"].UNITTEST != (args.site_profile == "pytest"):
+            raise RuntimeError("unexpected runtime flag")
+        dest.write_text(json.dumps(sites), encoding="utf-8")
+        return
+    data = json.loads(gzip.decompress(args.update_sites.read_bytes())) if args.update_sites else {"sites": {}, "tests": {}}
+    with tempfile.TemporaryDirectory() as directory:
+        for profile in ("clean", "pytest"):
+            output = Path(directory) / profile
+            subprocess.run([sys.executable, runner, str(root), str(output), "--site-profile", profile], check=True)
+            for path, lines in json.loads(output.read_bytes()).items():
+                previous = data["sites"].setdefault(path, {})
+                for line, modules in lines.items():
+                    previous[line] = sorted(set(previous.get(line, ())) | set(modules))
 
     def save():
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -131,6 +153,8 @@ def main():
         temp.replace(dest)
 
     save()
+    if args.update_sites:
+        return
     with tempfile.TemporaryDirectory() as tmp:
         def run_file(test):
             out = Path(tmp) / (test.replace("/", "_") + ".json")

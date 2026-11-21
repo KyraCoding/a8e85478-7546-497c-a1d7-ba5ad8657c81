@@ -59,6 +59,8 @@ def measure(task):
 
 
 def build(root, output):
+    import unittest
+
     global fixtures, owners, filenames
     sys.path.insert(0, str(root))
     fixtures = get_fixtures()
@@ -98,11 +100,11 @@ def build(root, output):
                 if meta.get("execute"):
                     add(node, ("rule", "duck"), "duck", suite, i)
                     add(node, ("rule",), "plan", suite, i)
-    with multiprocessing.get_context("fork").Pool(2, maxtasksperchild=1) as pool:
+    with multiprocessing.get_context("fork").Pool(min(2, os.process_cpu_count() or 1), maxtasksperchild=1) as pool:
         rows = pool.map(measure, tasks, chunksize=1)
     full_owners = {p: {n: p + ":" + f if f != "*" else f for n, f in lines.items()}
                    for p, lines in owners.items()}
-    data = {"version": 1, "tests": tests, "rows": rows, "sources": sources, "pins": boundary_hashes(root),
+    data = {"version": 2, "tests": tests, "rows": rows, "sources": sources, "pins": boundary_hashes(root),
             "owners": full_owners, "tokens": sorted(TokenType.__members__)}
     with gzip.GzipFile(str(output), "wb", mtime=0) as stream:
         stream.write(json.dumps(data, separators=(",", ":")).encode())

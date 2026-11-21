@@ -19,7 +19,7 @@ from map_store import read_map
 
 MAP = Path(__file__).resolve().parent / "maps" / "state.json.gz"
 VALID_PATH = re.compile(r"sqlglot/(?:[A-Za-z_]\w*/)*[A-Za-z_]\w*\.py\Z", re.ASCII)
-VERSION = 2
+VERSION = 3
 
 
 def _json(value):
@@ -152,6 +152,8 @@ def _guard():
 
 
 def _worker(request):
+    import unittest
+
     root = Path(request["root"]).resolve(strict=True)
     overlay = request["overlay"]
     loaded = set()
