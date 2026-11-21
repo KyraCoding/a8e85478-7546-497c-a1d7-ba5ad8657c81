@@ -13,6 +13,7 @@ WORKDIR /app
 FROM profiler AS selector
 WORKDIR /app
 RUN python -m compileall -q -x '/site-packages/' /usr/local/lib/python3.13 /opt/sqlglot/sqlglot /opt/sqlglot/tests
-COPY selector.py patches.py schedule.py semantics.py coverage_map.py declarations.py import_effects.py value_profile.py identity_profile.py heavy_profile.py replay.py tc_replay.py state_diff.py fixture_flow.py ./
+COPY selector.py map_store.py patches.py schedule.py semantics.py coverage_map.py declarations.py import_effects.py value_profile.py identity_profile.py heavy_profile.py replay.py tc_replay.py state_diff.py fixture_flow.py ./
 COPY maps/ ./maps/
+RUN python map_store.py
 CMD ["python", "/app/selector.py"]

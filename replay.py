@@ -1,4 +1,3 @@
-import gzip
 import hashlib
 import importlib
 import importlib.abc
@@ -11,13 +10,13 @@ from functools import cache
 from pathlib import Path
 from unittest import TestResult
 
+from map_store import read_map
 from semantics import semantic_lines
 
 
 @cache
 def _profile():
-    with gzip.open(Path(__file__).parent / "maps" / "replay.json.gz", "rb") as stream:
-        return json.load(stream)
+    return read_map(Path(__file__).parent / "maps" / "replay.json.gz")
 
 
 class PatchedImports(importlib.abc.MetaPathFinder, importlib.abc.Loader):

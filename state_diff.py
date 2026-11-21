@@ -1,5 +1,4 @@
 import ast
-import gzip
 import hashlib
 import importlib
 import importlib.machinery
@@ -15,6 +14,8 @@ import types
 from enum import Enum
 from functools import cache
 from pathlib import Path
+
+from map_store import read_map
 
 MAP = Path(__file__).resolve().parent / "maps" / "state.json.gz"
 VALID_PATH = re.compile(r"sqlglot/(?:[A-Za-z_]\w*/)*[A-Za-z_]\w*\.py\Z", re.ASCII)
@@ -260,8 +261,7 @@ def _edits(change):
 
 @cache
 def _map():
-    with gzip.open(MAP, "rb") as stream:
-        return json.load(stream)
+    return read_map(MAP)
 
 
 TIME_INPUTS = {"TIME_MAPPING", "FORMAT_MAPPING", "INVERSE_TIME_MAPPING"}

@@ -1,13 +1,12 @@
 import ast
-import gzip
 import hashlib
-import json
 import operator
 import re
 import zlib
 from functools import lru_cache
 from pathlib import Path
 
+from map_store import read_map
 from semantics import _baseline, patched_tree
 
 
@@ -110,8 +109,7 @@ def _difference(old, new):
 
 @lru_cache(maxsize=1)
 def _load():
-    with gzip.open(MAP, "rt", encoding="utf-8") as stream:
-        data = json.load(stream)
+    data = read_map(MAP)
     if data["version"] != 1:
         raise ValueError("unsupported operand profile")
     return data

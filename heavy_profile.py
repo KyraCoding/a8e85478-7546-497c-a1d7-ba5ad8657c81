@@ -1,10 +1,9 @@
 import ast
-import gzip
-import json
 from functools import lru_cache
 from pathlib import Path
 
 import value_profile as vp
+from map_store import read_map
 from semantics import _baseline, patched_tree
 
 MAP = Path(__file__).parent / "maps" / "heavy.json.gz"
@@ -56,8 +55,7 @@ def enum_compare(node):
 
 @lru_cache(maxsize=1)
 def load():
-    with gzip.open(MAP, 'rt', encoding='utf8') as f:
-        return json.load(f)
+    return read_map(MAP)
 
 
 def same(a, b):

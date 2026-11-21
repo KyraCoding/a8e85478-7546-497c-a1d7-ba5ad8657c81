@@ -1,16 +1,15 @@
-import gzip
 import io
-import json
 import os
 from functools import cache
 from pathlib import Path
 from types import FunctionType
 
+from map_store import read_map
+
 
 @cache
 def _index():
-    with gzip.open(Path(__file__).parent / "maps" / "fixture_flow.json.gz", "rt", encoding="utf-8") as stream:
-        return json.load(stream)
+    return read_map(Path(__file__).parent / "maps" / "fixture_flow.json.gz")
 
 
 @cache

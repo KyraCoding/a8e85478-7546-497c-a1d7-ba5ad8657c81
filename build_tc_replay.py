@@ -109,7 +109,7 @@ def build(root, output):
     print(f"{len(rows)} TPC boundaries, {output.stat().st_size} bytes")
 
 
-def build_parses(root):
+def build_parses(root, arguments=False):
     import pickle
     import unittest
     from concurrent.futures import Future
@@ -143,6 +143,13 @@ def build_parses(root):
     from sqlglot.dialects.dialect import Dialect
     from tests import test_executor, test_optimizer
 
+    if arguments:
+        from build_tc_arguments import install, save_arguments
+        import_hits = set(outside)
+        sites, touched = install(root)
+        outside.clear()
+        outside.update(import_hits)
+    reads = {}
     rows, indices, tests, excluded = [], {}, {}, {}
     used = set()
     def wrap(method, func):
@@ -166,10 +173,14 @@ def build_parses(root):
             key = json.dumps(descriptor, sort_keys=True)
             hits = set()
             active = hits
+            if arguments:
+                touched.clear()
             try:
                 result = func(self, *args, **opts)
             except BaseException:
                 outside.update(hits)
+                if arguments:
+                    reads[key] = None
                 raise
             finally:
                 active = outside
@@ -177,6 +188,8 @@ def build_parses(root):
                 value = digest(tree_state(result))
             except (ValueError, RecursionError, TypeError):
                 outside.update(hits)
+                if arguments:
+                    reads[key] = None
                 return result
             if key not in indices:
                 indices[key] = len(rows)
@@ -184,12 +197,17 @@ def build_parses(root):
             i = indices[key]
             if rows[i][1] != value:
                 outside.update(hits | rows[i][2])
+                if arguments:
+                    reads[key] = None
+            if arguments and reads.setdefault(key, set()) is not None:
+                reads[key].update(touched)
             used.add(i)
             rows[i][2].update(hits)
             return result
         return call
-    Dialect.parse = wrap("parse", Dialect.parse)
-    Dialect.parse_into = wrap("parse_into", Dialect.parse_into)
+    parse, parse_into = Dialect.parse, Dialect.parse_into
+    Dialect.parse = wrap("parse", parse)
+    Dialect.parse_into = wrap("parse_into", parse_into)
 
     class SerialPool:
         def __init__(self, *, initializer=None, initargs=(), **kwargs):
@@ -241,6 +259,10 @@ def build_parses(root):
     excluded = dict.fromkeys(tests, outside_union)
     for row in rows:
         row[2] = sorted(row[2])
+    if arguments:
+        Dialect.parse, Dialect.parse_into = parse, parse_into
+        save_arguments(source, rows, tests, excluded, sites, reads, touched)
+        return
     with gzip.GzipFile(str(PARSE_MAP), "wb", mtime=0) as stream:
         stream.write(json.dumps({"source": digest(source), "version": 1, "rows": rows,
                                  "lines": sorted(line_sites), "tests": tests, "outside": excluded},
@@ -254,5 +276,7 @@ if __name__ == "__main__":
     root = Path(sys.argv[1]).resolve()
     if sys.argv[2:] == ["--parses"]:
         build_parses(root)
+    elif sys.argv[2:] == ["--arguments"]:
+        build_parses(root, arguments=True)
     else:
         build(root, Path(sys.argv[2]) if len(sys.argv) > 2 else MAP)

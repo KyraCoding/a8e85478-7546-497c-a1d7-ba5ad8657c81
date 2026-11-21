@@ -1,18 +1,17 @@
 import ast
-import gzip
-import json
 import os
 import re
 from collections import defaultdict
 from functools import cache
 from pathlib import Path
 
+from map_store import read_map
+
 
 @cache
 def _index():
     path = Path(__file__).resolve().parent / "maps" / "declarations.json.gz"
-    with gzip.open(path, "rb") as stream:
-        data = json.load(stream)
+    data = read_map(path)
     descendants = defaultdict(set)
     for child, bases in data["parents"].items():
         for base in bases:
@@ -45,10 +44,8 @@ def _key(node):
 @cache
 def _lookup_index():
     folder = Path(__file__).resolve().parent / "maps"
-    with gzip.open(folder / "declarations-lookups.json.gz", "rb") as f:
-        data = json.load(f)
-    with gzip.open(folder / "declarations-access.json.gz", "rb") as f:
-        access = json.load(f)
+    data = read_map(folder / "declarations-lookups.json.gz")
+    access = read_map(folder / "declarations-access.json.gz")
     aliases = {(a, b): (c, d) for a, b, c, d in data.get("aliases", ())}
     return data["tests"], {tuple(r[:-1]): r[-1] for r in data["records"]}, aliases, access
 

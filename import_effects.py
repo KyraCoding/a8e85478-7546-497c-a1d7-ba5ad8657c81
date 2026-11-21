@@ -1,13 +1,13 @@
-import gzip
 import json
 from functools import cache
 from pathlib import Path
 
+from map_store import read_map
+
 
 @cache
 def _index():
-    with gzip.open(Path(__file__).parent / "maps" / "import_effects.json.gz", "rt", encoding="utf-8") as f:
-        data = json.load(f)
+    data = read_map(Path(__file__).parent / "maps" / "import_effects.json.gz")
     tests = {path: (set(modules), set(nodes)) for path, (modules, nodes) in data["tests"].items()}
     cache_file = Path(__file__).parent / "maps" / "cache_effects.json"
     return data["sites"], tests, json.loads(cache_file.read_bytes())
@@ -32,10 +32,8 @@ def _module(path):
 @cache
 def _isolated_items():
     directory = Path(__file__).parent / "maps"
-    with gzip.open(directory / "footprints.json.gz", "rt", encoding="utf-8") as f:
-        paths = json.load(f)
-    with gzip.open(directory / "replay.json.gz", "rt", encoding="utf-8") as f:
-        stress = json.load(f)
+    paths = read_map(directory / "footprints.json.gz")
+    stress = read_map(directory / "replay.json.gz")
     paths[stress["node"]] = stress["files"]
     return {name: frozenset(map(_module, files)) for name, files in paths.items()}
 

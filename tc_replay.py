@@ -1,5 +1,4 @@
 import ast
-import gzip
 import hashlib
 import importlib
 import importlib.util
@@ -12,12 +11,14 @@ import time
 from functools import lru_cache
 from pathlib import Path
 
+from map_store import read_map
 from patches import Change
 
 
 HERE = Path(__file__).resolve().parent
 MAP = HERE / "maps" / "tc_replay.json.gz"
 PARSE_MAP = HERE / "maps" / "tc_parse.json.gz"
+ARG_MAP = HERE / "maps" / "tc_arguments.json.gz"
 EX = "tests/test_executor.py::TestExecutor::test_"
 OP = "tests/test_optimizer.py::TestOptimizer::test_"
 TARGETS = {EX + "execute_tpcds", EX + "execute_tpch", EX + "optimized_tpch",
@@ -47,8 +48,7 @@ def boundary_hashes(root):
 
 @lru_cache(maxsize=1)
 def profile():
-    with gzip.open(MAP, "rt", encoding="utf-8") as stream:
-        data = json.load(stream)
+    data = read_map(MAP)
     if data["version"] != 1:
         raise ValueError("unsupported TPC map")
     return data
@@ -56,8 +56,41 @@ def profile():
 
 @lru_cache(maxsize=1)
 def parse_profile():
-    with gzip.open(PARSE_MAP, "rt", encoding="utf-8") as stream:
-        return json.load(stream)
+    return read_map(PARSE_MAP)
+
+
+@lru_cache(maxsize=1)
+def argument_profile():
+    try:
+        data = read_map(ARG_MAP)
+        pars = parse_profile()
+        if (data["version"] != 1 or data["complete"] is not True or data["source"] != pars["source"]
+                or data["profile"] != hashlib.sha256(PARSE_MAP.read_bytes()).hexdigest()
+                or not isinstance(data["reads"], list) or len(data["reads"]) != len(pars["rows"])):
+            return {}
+        sites = set(data["sites"])
+        unread = {}
+        for site in sites:
+            line, start, end = map(int, site.split(":"))
+            if line < 1 or start < 0 or end <= start:
+                return {}
+            unread.setdefault(line, []).append((start, end, site))
+        if any(row is not None and (not isinstance(row, list) or not sites.issuperset(row)) for row in data["reads"]):
+            return {}
+        return {line: [(start, end, {i for i, row in enumerate(data["reads"]) if row is not None and site not in row})
+                       for start, end, site in spans] for line, spans in unread.items()}
+    except (OSError, EOFError, ValueError, TypeError, KeyError, AttributeError):
+        return {}
+
+
+def unread_rows(change, line):
+    old = change.original.splitlines()[line - 1].encode()
+    new = change.patched.splitlines()[line - 1].encode()
+    for start, end, unused in argument_profile().get(line, ()):
+        replacement = {b"True": b"False", b"False": b"True"}.get(old[start:end])
+        if replacement is not None and old[:start] + replacement + old[end:] == new:
+            return unused
+    return set()
 
 
 def replay_parse(call):
@@ -302,6 +335,7 @@ def refine_tc(changes: list[Change], chosen: set[str], cov, catalog: set[str]) -
         nodes = candidates.intersection(data["tests"][group])
         tasks = {}
         extra = []
+        discharged = set()
         if change.path == "sqlglot/parser.py" and site != "*":
             try:
                 pars = parse_profile()
@@ -310,10 +344,13 @@ def refine_tc(changes: list[Change], chosen: set[str], cov, catalog: set[str]) -
                     nodes = set()
                     extra_nodes = {n for n in candidates & pars["tests"].keys()
                                    if key not in pars["outside"][n]}
+                    unused = unread_rows(change, line)
                     for i, (call, result, hits) in enumerate(pars["rows"]):
                         if key in hits:
                             users = [n for n in extra_nodes if i in pars["tests"][n]]
-                            if users:
+                            if i in unused:
+                                discharged.update(users)
+                            elif users:
                                 extra.append([["parse_call", call], result, users])
                 else:
                     return chosen
@@ -333,6 +370,13 @@ def refine_tc(changes: list[Change], chosen: set[str], cov, catalog: set[str]) -
             return chosen
         payload = {"changes": {change.path: change.patched}, "nodes": sorted(nodes),
                    "tasks": extra + [[*data["rows"][i][:2], nodeids] for i, nodeids in tasks.items()]}
+        complete = discharged - {node for _, _, users in payload["tasks"] for node in users}
+        if complete:
+            chosen = chosen - complete
+            nodes -= complete
+            if not nodes:
+                return chosen
+            payload["nodes"] = sorted(nodes)
         proc = subprocess.run([sys.executable, "-B", str(Path(__file__).resolve()), "--child"],
                               input=json.dumps(payload), capture_output=True, text=True, timeout=min(6, _wall_left),
                               env={**os.environ, "PYTHONHASHSEED": "0", "PYTHONDONTWRITEBYTECODE": "1"})

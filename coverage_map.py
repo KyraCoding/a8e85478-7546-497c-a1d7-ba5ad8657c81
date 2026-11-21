@@ -1,13 +1,9 @@
-import gzip
-import json
-from pathlib import Path
+from map_store import MAPS, read_json_map, read_map
 
 
 class Coverage:
     def __init__(self, path=None):
-        path = path or Path(__file__).parent / "maps" / "coverage.json.gz"
-        with gzip.open(path, "rt", encoding="utf-8") as stream:
-            data = json.load(stream)
+        data = read_json_map(path) if path else read_map(MAPS / "coverage.json.gz")
         self.nodes = data["nodes"]
         self.missing = set(data["missing"])
         self._lines = data["lines"]
