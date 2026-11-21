@@ -132,7 +132,7 @@ def semantic_lines(path: str, original: str, patched: str, old_lines: set[int]) 
     return None if lines is None else lines.copy()
 
 
-@lru_cache(maxsize=1)
+@lru_cache(maxsize=16)
 def _changed_lines(path, original, patched):
     try:
         old, compiled_old, executable = _baseline(path, original)
