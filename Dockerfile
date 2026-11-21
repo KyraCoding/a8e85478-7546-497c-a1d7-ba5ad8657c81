@@ -27,7 +27,12 @@ COPY selector.py map_store.py patches.py schedule.py semantics.py coverage_map.p
 COPY registry_context.py registry_readers.json ./
 COPY fe_replay.py fe_fence.py fe_baseline.json.gz fe_consumer.json.gz fe_lines.json.gz ./
 COPY ds_verify.py ds_operations.py ds_origin.py ds_worker.py ds_sites.json.gz ./
+COPY fork_check.py import_state.py mn_reduced.py ./
 COPY maps/ ./maps/
 COPY --from=native /out/ ./
-RUN python map_store.py && python -m compileall -q -l /app
+RUN python map_store.py \
+ && PYTHONHASHSEED=0 python import_state.py --record /opt/sqlglot \
+ && PYTHONHASHSEED=0 python mn_reduced.py --record /opt/sqlglot \
+ && python fork_check.py --closure /app/fork_closure.json \
+ && python -m compileall -q -l /app
 CMD ["python", "/app/selector.py"]

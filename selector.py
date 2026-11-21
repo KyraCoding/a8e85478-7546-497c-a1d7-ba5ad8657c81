@@ -21,9 +21,12 @@ from state_diff import refine_state
 from tc_replay import refine_tc
 from value_profile import refine
 from source_reader import refine_source_reader
+from fork_check import check_run
+from import_state import PatchState, narrow, settled_consumers
+from mn_reduced import refine_max_nodes
 
 
-def candidates(change, cov, catalog, *, fixtures_only=False):
+def candidates(change, cov, catalog, *, fixtures_only=False, state=None, tests_by_file=None):
     path = change.path
     if change.structural:
         return catalog
@@ -48,7 +51,8 @@ def candidates(change, cov, catalog, *, fixtures_only=False):
         except SyntaxError:
             result = None
         if result is None:
-            return module_fallback(path, cov, catalog)
+            fallback = module_fallback(path, cov, catalog)
+            return narrow(change, fallback, state, cov, catalog, tests_by_file or {})
     else:
         result = cov.lines(path, lines)
         if not cov.present(path) and not path.startswith("sqlglot/"):
@@ -56,7 +60,8 @@ def candidates(change, cov, catalog, *, fixtures_only=False):
         result = refine(path, change.original, change.patched, change.removed, result)
         result = refine_identity(path, change.original, change.patched, change.removed, result)
         result = refine_heavy(change, lines, result)
-        result.update(import_consumers(path, lines, cov, catalog))
+        consumers = import_consumers(path, lines, cov, catalog)
+        result.update(settled_consumers(change, lines, consumers, state, tests_by_file or {}, cov, catalog, result))
     return result | readers | cov.missing
 
 
@@ -67,6 +72,10 @@ def main():
     numbers = {test["id"]: test["number"] for test in tests}
     millis = {test["number"]: round(1000 * test["seconds"]) for test in tests}
     catalog = set(numbers)
+    seconds = {test["id"]: test["seconds"] for test in tests}
+    tests_by_file = {}
+    for test in tests:
+        tests_by_file.setdefault(test["file"], set()).add(test["id"])
     cov = Coverage()
     unseen = catalog.difference(cov.nodes)
     patches = sorted((data / "commits").glob("*.patch"))
@@ -82,8 +91,10 @@ def main():
             else:
                 chosen = set()
                 fixtures_only = all(c.path.startswith("tests/fixtures/") and not c.structural for c in changes)
+                state = PatchState(changes, source, verify_until, seconds)
                 for change in changes:
-                    chosen.update(candidates(change, cov, catalog, fixtures_only=fixtures_only))
+                    chosen.update(candidates(change, cov, catalog, fixtures_only=fixtures_only,
+                                             state=state, tests_by_file=tests_by_file))
                 if chosen and time.monotonic() < verify_until:
                     frontend_allowed = not chosen.issuperset(catalog)
                     chosen = refine_defaults(changes, chosen, cov, catalog)
@@ -96,7 +107,9 @@ def main():
                         chosen = refine_frontend(changes, chosen, cov, catalog, verify_until,
                                                  padding.full_cost if padding is not None else None)
                     chosen = refine_source_reader(changes, chosen, cov, source)
+                    chosen = refine_max_nodes(changes, chosen, cov, catalog, verify_until)
             chosen.update(unseen)
+            chosen = check_run(changes, chosen, cov, numbers, millis, verify_until, patch)
         except (SyntaxError, ValueError, IndexError, KeyError, OSError, RecursionError) as exc:
             print(f"{patch.name}: using full suite ({type(exc).__name__})", file=sys.stderr)
             chosen = catalog
