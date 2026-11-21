@@ -85,7 +85,8 @@ def _patched(path, source):
     try:
         code = compile(tree, path, "exec", dont_inherit=True)
     except Exception as exc:
-        code = exc
+        # Drop the traceback: its frame holds the tree, and this process runs without cyclic collection.
+        code = exc.with_traceback(None)
     return tree, code
 
 
