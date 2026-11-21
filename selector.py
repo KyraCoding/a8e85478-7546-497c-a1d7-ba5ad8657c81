@@ -1,3 +1,10 @@
+if __name__ == "__main__":
+    # The selector process is short-lived and its large maps and syntax trees are acyclic, so
+    # reference counting frees its garbage; cyclic collection would only re-scan them.
+    import gc
+
+    gc.disable()
+
 import json
 import os
 import sys
