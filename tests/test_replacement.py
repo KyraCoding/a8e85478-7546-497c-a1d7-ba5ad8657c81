@@ -1,10 +1,19 @@
 import unittest
+from unittest.mock import patch
 
 from fe_fence import single_replacement
+from fe_replay import DS, _saving
 from patches import Change
 
 
 class ReplacementTests(unittest.TestCase):
+    def test_full_schedule_coverage(self):
+        catalog = {DS, "short", "unused"}
+        durations = {DS: (0, 20000), "short": (1, 0), "unused": (2, 0)}
+        with patch("fe_replay._durations", return_value=durations):
+            self.assertEqual(_saving({DS, "short"}, catalog, 22000), 0)
+            self.assertEqual(_saving({DS, "short"}, catalog, None), 20)
+
     def test_single_operand(self):
         for old, new in (
             ("a is b", "a == b"),

@@ -80,7 +80,7 @@ def _durations():
     return {test["id"]: (test["number"], round(1000 * test["seconds"])) for test in tests}
 
 
-def _saving(chosen, catalog):
+def _saving(chosen, catalog, full_cost):
     from schedule import distribute
 
     table = _durations()
@@ -91,7 +91,10 @@ def _saving(chosen, catalog):
         return max(sum(millis[n] for n in worker) for worker in workers) + 2000 * len(workers) if workers else 0
 
     nodes = [node for node in chosen if node in catalog and node in table]
-    return (cost(nodes) - cost([node for node in nodes if node != DS])) / 1000
+    before = cost(nodes)
+    if full_cost is not None and before >= full_cost:
+        return 0.0
+    return (before - cost([node for node in nodes if node != DS])) / 1000
 
 
 def _expected_cpu(parent, worker):
@@ -141,7 +144,7 @@ def _admissible(changes, cov, catalog, consumer):
     return (sources, changed) if sources else "no executable edit"
 
 
-def refine_frontend(changes, chosen, cov, catalog, verify_until):
+def refine_frontend(changes, chosen, cov, catalog, verify_until, full_cost=None):
     if DS not in chosen or DS not in catalog or DS in cov.missing or DS not in cov.nodes:
         return chosen
     try:
@@ -152,7 +155,7 @@ def refine_frontend(changes, chosen, cov, catalog, verify_until):
         if isinstance(admitted, str) or not _environment():
             return chosen
         parent, worker = _plan(admitted[1])
-        if _saving(chosen, catalog) < 1.5 * _expected_cpu(parent, worker) + 1.0:
+        if _saving(chosen, catalog, full_cost) < 1.5 * _expected_cpu(parent, worker) + 1.0:
             return chosen
         verdict = _replay({"sources": admitted[0], "parent": parent, "worker": worker},
                           min(WALL_LIMIT, remaining - 1))
