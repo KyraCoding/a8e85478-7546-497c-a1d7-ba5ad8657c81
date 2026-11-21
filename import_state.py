@@ -174,7 +174,9 @@ def _has_unmapped_code(changes, sources, remap, base):
                    for line in added):
             continue
         module = path[:-3].replace("/", ".").removesuffix(".__init__")
-        top = compile(sources[path].encode("utf-8"), path, "exec", dont_inherit=True)
+        from semantics import patched_code
+
+        top = patched_code(path, sources[path])
         _, codes, _ = _index_code({module: (path, top)}, remap)
         for ident in codes.keys() - base["code"].get(path, {}).keys():
             if ident not in base["extents"] and not any(ident in other for other in base["code"].values()):
