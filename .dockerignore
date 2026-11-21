@@ -1,0 +1,6 @@
+.git
+.work
+.private
+crossagentchat
+**/__pycache__
+**/.pytest_cache

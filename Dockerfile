@@ -1,0 +1,18 @@
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS source
+ARG SQLGLOT_COMMIT=eb11aec4be8cb2122afe713a4816662c3f0fb2fa
+WORKDIR /opt/sqlglot
+RUN python -c "import urllib.request; urllib.request.urlretrieve('https://codeload.github.com/tobymao/sqlglot/tar.gz/${SQLGLOT_COMMIT}', '/tmp/sqlglot.tar.gz')" \
+ && tar xzf /tmp/sqlglot.tar.gz --strip-components=1 \
+ && rm /tmp/sqlglot.tar.gz
+ENV PYTHONPATH=/opt/sqlglot SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1
+
+FROM source AS profiler
+RUN pip install --no-cache-dir pytest==9.2.0 pytest-timeout==2.4.0 duckdb==2.0.0 numpy==2.5.5 pandas==3.1.1 python-dateutil==4.0.0 pytz==2026.6 typing_extensions==4.16.0 psutil==7.2.2 setuptools==84.2.1 setuptools-scm==10.3.4
+WORKDIR /app
+
+FROM profiler AS selector
+WORKDIR /app
+RUN python -m compileall -q -x '/site-packages/' /usr/local/lib/python3.13 /opt/sqlglot/sqlglot /opt/sqlglot/tests
+COPY selector.py patches.py schedule.py semantics.py coverage_map.py declarations.py import_effects.py value_profile.py identity_profile.py heavy_profile.py replay.py tc_replay.py state_diff.py fixture_flow.py ./
+COPY maps/ ./maps/
+CMD ["python", "/app/selector.py"]
