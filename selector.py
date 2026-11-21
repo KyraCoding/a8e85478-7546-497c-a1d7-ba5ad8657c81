@@ -98,7 +98,7 @@ def main():
             text = patch.read_text(encoding="utf-8")
             changes = read_changes(text, source)
             state = PatchState(changes, source, verify_until, seconds)
-            ordered = any(generator_initialization_changed(c) or expression_contract_narrowed(c, state) for c in changes)
+            ordered = any(generator_initialization_changed(c, changes) or expression_contract_narrowed(c, state) for c in changes)
             if ordered:
                 chosen = set(catalog)
             elif all(inert_change(c, cov) for c in changes) and safe_headers(text):

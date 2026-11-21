@@ -186,11 +186,21 @@ def _executed_effects(node):
         yield from _executed_effects(child)
 
 
-def _definition_effects(node, owner=()):
+def _statement_targets(statement):
+    """What an expression statement binds or writes, so that retargeting an unchanged call still differs."""
+    if isinstance(statement, ast.Assign):
+        return tuple(_dump_key(target) for target in statement.targets)
+    if isinstance(statement, ast.AnnAssign):
+        return (_dump_key(statement.target),)
+    return ()
+
+
+def _definition_effects(node, owner=(), skip=None):
     if isinstance(node, _DEFINITIONS):
         owner = (*owner, node.name)
         for position, decorator in enumerate(node.decorator_list):
-            yield owner, "decorator", position, _dump_key(decorator)
+            if skip is None or not skip(node, decorator):
+                yield owner, "decorator", position, _dump_key(decorator)
         if isinstance(node, ast.ClassDef):
             expressions = (*node.bases, *(keyword.value for keyword in node.keywords))
         else:
@@ -215,22 +225,112 @@ def _definition_effects(node, owner=()):
                         yield owner, "control", effect
     for child in ast.iter_child_nodes(node):
         if isinstance(child, _DEFINITION_SCOPES):
-            yield from _definition_effects(child, owner)
+            yield from _definition_effects(child, owner, skip)
         elif isinstance(child, ast.stmt):
             if isinstance(child, (ast.Expr, ast.Assign, ast.AnnAssign)) and isinstance(child.value, ast.Call):
-                yield owner, "expression", _dump_key(child.value)
+                if skip is None or not skip(node, child):
+                    yield owner, "expression", _statement_targets(child), _dump_key(child.value)
             else:
                 for effect in _executed_effects(child):
                     yield owner, "statement", effect
 
 
-def generator_initialization_changed(change):
+# Definition-time calls that only build values: a builtin constructor over literals bound to a plain name, and the
+# base generator's unsupported_args(<literals>) applied to a function (a dict plus a functools.wraps closure).
+_INERT_CONSTRUCTORS = frozenset({"frozenset", "set", "tuple"})
+_INERT_DECORATORS = frozenset({"unsupported_args"})
+
+
+def _literal(node):
+    if isinstance(node, ast.Constant):
+        return True
+    return isinstance(node, (ast.Tuple, ast.List, ast.Set)) and all(_literal(element) for element in node.elts)
+
+
+def _rebound(tree):
+    """Inert callee names the module binds itself; only `from sqlglot.generator import unsupported_args` is allowed."""
+    names = _INERT_CONSTRUCTORS | _INERT_DECORATORS
+    bound = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            found = {node.id}
+        elif isinstance(node, (*_DEFINITIONS, ast.ExceptHandler, ast.MatchAs, ast.MatchStar,
+                               ast.TypeVar, ast.ParamSpec, ast.TypeVarTuple)):
+            found = {node.name}
+        elif isinstance(node, ast.arg):
+            found = {node.arg}
+        elif isinstance(node, ast.MatchMapping):
+            found = {node.rest}
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            found = set()
+            for alias in node.names:
+                if alias.name == "*":
+                    found |= names
+                elif not (isinstance(node, ast.ImportFrom) and node.module == "sqlglot.generator"
+                          and alias.name == "unsupported_args" and alias.asname is None):
+                    found.add(alias.asname or alias.name.split(".")[0])
+        else:
+            continue
+        bound |= found & names
+    return bound
+
+
+def _inert_call(node, bound, callees):
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in callees
+            and node.func.id not in bound and all(_literal(argument) for argument in node.args)
+            and all(keyword.arg is not None and _literal(keyword.value) for keyword in node.keywords))
+
+
+def _naming(text, token, application=None):
+    return sorted(line.strip() for line in text.split("\n")
+                  if token in line and not (application and line.strip().startswith(application)))
+
+
+def _inert_kinds(changes):
+    """Which inert calls the whole patch leaves trustworthy: none if it moves files, constants unless it edits a line
+    naming builtins, decorators unless it edits sqlglot/generator.py or a non-decorator line naming unsupported_args."""
+    if not changes or any(change.structural for change in changes):
+        return frozenset()
+    kinds = {"constant", "decorator"}
+    if any(_naming(change.original, "builtins") != _naming(change.patched, "builtins") for change in changes):
+        kinds.discard("constant")
+    if any(change.path == "sqlglot/generator.py"
+           or _naming(change.original, "unsupported_args", "@unsupported_args(")
+           != _naming(change.patched, "unsupported_args", "@unsupported_args(") for change in changes):
+        kinds.discard("decorator")
+    return frozenset(kinds)
+
+
+def _inert_skip(tree, kinds):
+    bound = _rebound(tree)
+
+    def skip(parent, node):
+        if isinstance(node, ast.stmt):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
+            annotation = getattr(node, "annotation", None)
+            return ("constant" in kinds and _inert_call(node.value, bound, _INERT_CONSTRUCTORS)
+                    and all(isinstance(target, ast.Name) for target in targets)
+                    and (annotation is None or not any(isinstance(n, ast.Call) for n in ast.walk(annotation))))
+        # Decorators on classes stay effects: only a function decorated with the base factory is exempt.
+        return ("decorator" in kinds and isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and _inert_call(node, bound, _INERT_DECORATORS))
+
+    return skip
+
+
+def generator_initialization_changed(change, changes=None):
+    """True when a generator module's definition-time effects differ, or a changed scope may write shared state.
+    Given the whole patch (`changes`), inert calls (see _inert_skip and _inert_kinds) are left out of the effect
+    comparison on both sides; the deferred and reflective write guard below still decides every such patch."""
     if not change.path.startswith("sqlglot/generators/") or not change.path.endswith(".py"):
         return False
     original = _baseline(change.path, change.original)[0]
     patched = patched_tree(change.path, change.patched)
     if tuple(_definition_effects(original)) != tuple(_definition_effects(patched)):
-        return True
+        kinds = _inert_kinds(changes)
+        if not kinds or (tuple(_definition_effects(original, skip=_inert_skip(original, kinds)))
+                         != tuple(_definition_effects(patched, skip=_inert_skip(patched, kinds)))):
+            return True
     if change.removed or change.added:
         old = _changed_shared_scopes(original, change.removed) if change.removed else ()
         new = _changed_shared_scopes(patched, change.added) if change.added else ()

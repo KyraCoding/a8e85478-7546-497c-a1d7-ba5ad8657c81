@@ -120,3 +120,74 @@ class GeneratorDefaultsTests(unittest.TestCase):
         for target, expected in (("self.dialect.FUNCTIONS", True), ("scratch", False)):
             body = self.original.replace("return x", f"{target}.update(x)\n        return x")
             self.assertEqual(generator_initialization_changed(Change(self.path, self.original, body, {3}, {3, 4})), expected)
+
+
+class GeneratorInertCallTests(unittest.TestCase):
+    path = "sqlglot/generators/example.py"
+    original = ("from sqlglot.generator import Generator, unsupported_args\n\n"
+                "_CHARS = frozenset('ab')\n\n\n"
+                "class R(Generator):\n"
+                "    KEYS = tuple(['x'])\n\n"
+                "    def render(self, x):\n"
+                "        return x\n")
+    decorated = original.replace("    def render", "    @unsupported_args('options', ('mode', 'note'))\n    def render")
+    write = "setattr(Generator, 'flag', 1)"
+
+    def gate(self, after, original=None, extra=(), removed=(), added=()):
+        change = Change(self.path, self.original if original is None else original, after, set(removed), set(added))
+        return generator_initialization_changed(change), generator_initialization_changed(change, [change, *extra])
+
+    def test_inert_calls_keep_the_normal_selection(self):
+        for after in (self.original.replace("frozenset('ab')", "frozenset('abc')"),
+                      self.original.replace("tuple(['x'])", "tuple(['x', 'y'])"),
+                      self.original.replace("\n\n\nclass", "\n_MORE: frozenset = set(['c'])\nset()\n\n\nclass"),
+                      self.original.replace("_CHARS =", "_LETTERS ="),
+                      self.decorated,
+                      self.decorated.replace("    def render", "    async def render")):
+            with self.subTest(after=after):
+                self.assertEqual(self.gate(after), (True, False))
+
+    def test_shadowed_or_evaluating_calls_stay_eager(self):
+        literal = self.original.replace("frozenset('ab')", "frozenset('abc')")
+        cases = {
+            "evaluated argument": self.original.replace("frozenset('ab')", f"frozenset({self.write} or 'ab')"),
+            "set comprehension": self.original.replace("frozenset('ab')", "frozenset({c for c in 'ab'})"),
+            "rebound constructor": literal.replace("_CHARS =", "frozenset = lambda *a: set()\n_CHARS ="),
+            "star import": literal.replace("\n\n_CHARS", "\nfrom sqlglot.helper import *\n\n_CHARS"),
+            "except as": literal.replace("_CHARS =", "try:\n    pass\nexcept Exception as frozenset:\n    pass\n_CHARS ="),
+            "call in annotation": literal.replace("_CHARS =", f"_CHARS: {self.write} ="),
+            "next to a write": literal.replace("_CHARS =", f"{self.write}\n_CHARS ="),
+            "aliased factory": self.decorated.replace("unsupported_args\n", "unsupported_args as ua\n")
+                                             .replace("@unsupported_args(", "@ua("),
+            "rebound factory": self.decorated.replace("\n\n_CHARS", "\nunsupported_args = lambda *a: (lambda f: f)\n_CHARS"),
+            "evaluated factory argument": self.decorated.replace("'options',", f"{self.write} or 'options',"),
+            "class decorator": self.original.replace("class R", "@unsupported_args('options')\nclass R"),
+            "retargeted to a shared attribute": self.original.replace("_CHARS =", "Generator.CHARS ="),
+        }
+        for name, after in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(self.gate(after), (True, True))
+        foreign = self.original.replace("_CHARS = frozenset('ab')", "Generator.CHARS = frozenset('ab')")
+        self.assertEqual(self.gate(foreign.replace("'ab'", "'abc'"), original=foreign), (True, True))
+
+    def test_deferred_writes_still_decide_after_inert_effects(self):
+        for target, expected in (("setattr(Generator, 'flag', x)", True), ("self.dialect.FUNCTIONS.update(x)", True),
+                                 ("scratch.update(x)", False)):
+            after = self.decorated.replace("        return x", f"        {target}\n        return x")
+            for lines in ({}, {"added": {9, 11}}):
+                with self.subTest(target=target, lines=lines):
+                    self.assertEqual(self.gate(after, **lines), (True, expected))
+
+    def test_patch_wide_conditions(self):
+        literal = self.original.replace("frozenset('ab')", "frozenset('abc')")
+        helper = Change("sqlglot/helper.py", "x = 1\n", "import builtins\nx = 1\n")
+        factory = Change("sqlglot/generator.py", "x = 1\n", "x = 2\n")
+        monkeypatch = Change("sqlglot/helper.py", "x = 1\n", "x = 1\ngenerator.unsupported_args = None\n")
+        moved = Change("sqlglot/other.py", "", "", structural=True)
+        self.assertEqual(self.gate(literal, extra=[helper]), (True, True))
+        self.assertEqual(self.gate(literal, extra=[factory]), (True, False))
+        self.assertEqual(self.gate(literal, extra=[moved]), (True, True))
+        for extra in (factory, monkeypatch):
+            with self.subTest(extra=extra.path):
+                self.assertEqual(self.gate(self.decorated, extra=[extra]), (True, True))
+        self.assertEqual(self.gate(self.decorated, extra=[helper]), (True, False))
