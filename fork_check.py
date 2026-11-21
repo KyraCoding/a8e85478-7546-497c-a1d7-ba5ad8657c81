@@ -15,6 +15,15 @@ HEAVY_COLLECTED = frozenset({
 SKIP_IDS = frozenset({"tests/test_parser.py::TestParser::test_max_nodes"})
 IGNORED_PREFIXES = ("docs/", ".github/")
 
+# These pinned test bodies register custom dialects or clear their registry.
+_REGISTRY_TESTS = (
+    "tests/dialects/test_dialect.py::TestDialect::test_custom_dialect",
+    "tests/dialects/test_dialect.py::TestDialect::test_get_or_raise",
+    "tests/test_dialect_entry_points.py::TestDialectEntryPoints::test_entry_point_plugin_discovery_legacy_api",
+    "tests/test_dialect_entry_points.py::TestDialectEntryPoints::test_entry_point_plugin_discovery_modern_api",
+    "tests/test_dialect_entry_points.py::TestDialectEntryPoints::test_entry_point_plugin_not_found",
+)
+
 MAX_MS = int(os.environ.get("CHECK_RUN_MAX_MS", "1000"))
 MAX_TESTS = int(os.environ.get("CHECK_RUN_MAX_TESTS", "120"))
 CPU_CAP = float(os.environ.get("CHECK_RUN_CPU_CAP", "40"))
@@ -258,6 +267,8 @@ def _check_run(changes, chosen, cov, numbers, millis, verify_until, patch):
         return chosen
     if len(chosen) > MAX_TESTS:
         return _skip(chosen, "many")
+    if chosen.issuperset(numbers):
+        return _skip(chosen, "full-catalog")
     tests = []
     total = 0
     heavy = 0
@@ -287,7 +298,33 @@ def _check_run(changes, chosen, cov, numbers, millis, verify_until, patch):
     wall = 4 + 4 * cpu
     if time.monotonic() + wall > verify_until or _client.spent + cpu > CPU_CAP or _client.wall + cpu > WALL_CAP:
         return _skip(chosen, "budget")
-    return _dispatch(changes, chosen, numbers, patch, tests, total, modules, need_line, cpu, wall)
+    tests.sort()
+    partial = _partial_context(changes, chosen, numbers, millis, tests)
+    return _dispatch(changes, chosen, numbers, patch, tests, total, modules, need_line, cpu, wall, partial)
+
+
+def _partial_context(changes, chosen, numbers, millis, tests):
+    """Return additional ordered cases, or None to keep whole-job verification."""
+    # At stock admission (<= 1 s), the packer always buys one worker. After a
+    # failure that worker remains, so each finished millisecond is worth one ms.
+    if (len(tests) != len(chosen) or len(tests) < 2 or MAX_MS > 1000
+            or any(c.path.startswith("tests/") for c in changes)):
+        return None
+    if not all(node in numbers for node in _REGISTRY_TESTS):
+        return None
+    gross = sum(millis[t[0]] for t in tests[:-1])
+    context = []
+    for node in _REGISTRY_TESTS:
+        n = numbers[node]
+        if n < tests[-1][0] and node not in chosen:
+            file, cls, method = node.split("::")
+            context.append((n, file[:-3].replace("/", "."), cls, method))
+    # The stock job already pays for its selected siblings. Charge extra
+    # registry bodies and allow 50 ms for their imports and fixture transitions.
+    extra = sum(millis[t[0]] for t in context)
+    if gross <= extra + 50 or len(tests) + len(context) > MAX_TESTS:
+        return None
+    return context
 
 
 def _prepare(changes, chosen, cov, numbers):
@@ -328,7 +365,7 @@ def _prepare(changes, chosen, cov, numbers):
     return modules, need_line
 
 
-def _dispatch(changes, chosen, numbers, patch, tests, total, modules, need_line, cpu, wall):
+def _dispatch(changes, chosen, numbers, patch, tests, total, modules, need_line, cpu, wall, partial=None):
     if not _order:
         for node, number in numbers.items():
             file = node.partition("::")[0]
@@ -348,24 +385,52 @@ def _dispatch(changes, chosen, numbers, patch, tests, total, modules, need_line,
         _client.widen(patch)
         if len(_client.loaded) == TIERS and not names & _client.loaded[3]:
             level = 3
+    context = {t[0] for t in partial or ()}
+    if partial is not None:
+        tests = sorted([*tests, *partial])
     imports = []
     if level < 2:
         files = {t[1] for t in tests}
+        if partial is not None:
+            # Collection registers FakeDialect even before the first method.
+            files.add("tests.test_dialect_entry_points")
         files.update(_client.first[name] for name in names if name in _client.first)
         keys = {f[:-3].replace("/", "."): n for f, n in _order.items()}
         imports = sorted(files, key=lambda f: keys.get(f, 1 << 30))
-    tests.sort()
     _client.jobs += 1
     job = {"op": "job", "id": _client.jobs, "modules": modules, "tests": tests, "need_line": sorted(need_line),
-           "imports": imports, "cpu": cpu, "wall": wall}
+           "imports": imports, "cpu": cpu, "wall": wall, "context": context}
     reply = _client.run(level, job)
-    status = reply.get("tests") or {}
-    passed = [t[0] for t in tests if status.get(t[0]) == "pass"]
-    clear = (reply.get("status") == "ok" and not reply.get("moved") and not reply.get("taint")
-             and len(passed) == len(tests))
-    if not clear:
+    return _retained(reply, chosen, numbers, tests, partial)
+
+
+def _retained(reply, chosen, numbers, tests, partial):
+    if (reply.get("status") != "ok" or reply.get("exit") != 0 or reply.get("moved") != []
+            or reply.get("taint") != [] or not reply.get("fixtures_closed")):
         return chosen
-    return {node for node in chosen if node not in numbers}
+    status = reply.get("tests")
+    if not isinstance(status, dict) or status.keys() != {t[0] for t in tests}:
+        return chosen
+    if all(status.get(t[0]) == "pass" for t in tests):
+        return {node for node in chosen if node not in numbers}
+    if partial is None:
+        return chosen
+    # An unfinished module may still have teardown work registered by a later
+    # sibling. Only salvage within the failed module if it ran through the end.
+    context = {t[0] for t in partial}
+    passed = set()
+    for n, module, _, _ in tests:
+        verdict = status.get(n)
+        if verdict != "pass":
+            if verdict not in ("fail", "error") or n in context:
+                return chosen
+            if any(t[1] == module and t[0] > n for t in tests):
+                passed.difference_update(t[0] for t in tests if t[1] == module)
+            break
+        passed.add(n)
+    if not passed.difference(context):
+        return chosen
+    return {node for node in chosen if numbers.get(node) not in passed}
 
 
 def _zygote_main():
@@ -530,9 +595,13 @@ def _run_job(level, job, inherited):
     if status == "ok" and exit_status == 0:
         data = b"".join(chunks)
         try:
-            reply = marshal.loads(data[4:4 + struct.unpack_from("<I", data)[0]], allow_code=False)
+            if len(data) - 4 != struct.unpack_from("<I", data)[0]:
+                raise ValueError("incomplete worker reply")
+            reply = marshal.loads(data[4:], allow_code=False)
         except Exception:
             status = "crash"
+    elif exit_status and status == "ok":
+        status = "crash"
     if not isinstance(reply, dict):
         reply = {"status": status}
     reply["exit"] = exit_status
@@ -633,6 +702,7 @@ def _worker(level, job, out_fd, tmp):
     class_hits = set()
 
     def alarm(signum, frame):
+        reply["status"] = "cpu-timeout"
         raise _Abort()
 
     signal.signal(signal.SIGPROF, alarm)
@@ -828,6 +898,7 @@ def _worker(level, job, out_fd, tmp):
             cases.append((number, case))
             index[id(case)] = number
         need_line = set(job["need_line"])
+        context = job.get("context", ())
         bad_classes = set()
         seen = {}
 
@@ -851,8 +922,9 @@ def _worker(level, job, out_fd, tmp):
                 if verdict == "pass":
                     if number in blocked:
                         verdict = "blocked"
-                    elif any(path not in reached and (must is None or number in must)
-                             for path, must in must_reach.items()):
+                    elif number not in context and any(
+                        path not in reached and (must is None or number in must) for path, must in must_reach.items()
+                    ):
                         verdict = "nomodule"
                     elif number in need_line and number not in line_hits and type(test) not in class_hits:
                         verdict = "noline"
@@ -929,6 +1001,7 @@ def _worker(level, job, out_fd, tmp):
                 break
             fixtures(case)
         fixtures(None)
+        reply["fixtures_closed"] = not bad_classes and None not in blocked and not broken
         logging.root.removeHandler(handler)
         for number, case in cases:
             if type(case) in bad_classes:
