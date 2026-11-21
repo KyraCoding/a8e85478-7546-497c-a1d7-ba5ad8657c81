@@ -8,6 +8,7 @@ from coverage_map import Coverage
 from declarations import declaration_candidates
 from default_profile import refine_defaults
 from ds_verify import refine_ds
+from expression_additions import refine_expression_additions
 from fixture_flow import refine_fixture
 from heavy_profile import refine_heavy
 from identity_profile import refine_identity
@@ -98,6 +99,7 @@ def main():
                                              state=state, tests_by_file=tests_by_file))
                 if chosen and time.monotonic() < verify_until:
                     frontend_allowed = not chosen.issuperset(catalog)
+                    chosen = refine_expression_additions(changes, chosen, cov, catalog)
                     chosen = refine_defaults(changes, chosen, cov, catalog)
                     chosen = refine_state(changes, chosen, cov, catalog)
                     chosen = refine_replay(changes, chosen, cov, catalog)
