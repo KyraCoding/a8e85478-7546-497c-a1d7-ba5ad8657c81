@@ -1,12 +1,13 @@
 import ast
 import copy
+import hashlib
 import os
 import re
 from collections import defaultdict
 from functools import cache
 from pathlib import Path
 
-from map_store import read_grouped, read_map
+from map_store import expression_consumer_profile, read_grouped, read_map
 from semantics import _baseline, patched_tree
 
 
@@ -129,6 +130,124 @@ def _entry_edits(a, b, symbols):
         if v is not None and not _safe_reference(v, known, symbols):
             return None
     return changes, shape
+
+
+def _alias_group(value):
+    if not (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
+            and value.func.attr == "fromkeys" and isinstance(value.func.value, ast.Name)
+            and value.func.value.id == "dict" and len(value.args) == 2 and not value.keywords):
+        return ()
+    keys, handler = value.args
+    if not (isinstance(keys, ast.Tuple) and isinstance(handler, ast.Lambda)
+            and not handler.args.defaults and not any(handler.args.kw_defaults)):
+        return ()
+    names = tuple(k.value for k in keys.elts if isinstance(k, ast.Constant)
+                  and type(k.value) is str and re.fullmatch(r"[A-Z][A-Z0-9_]*", k.value))
+    return names if len(names) == len(keys.elts) == len(set(names)) else ()
+
+
+def _dispatch_handler(value):
+    bound = isinstance(value, ast.Attribute) and value.attr == "from_arg_list"
+    if bound:
+        target = value.value
+    elif isinstance(value, ast.Lambda):
+        args = value.args
+        if (len(args.args) != 1 or args.posonlyargs or args.vararg or args.kwonlyargs
+                or args.kwarg or args.defaults or not isinstance(value.body, ast.Call)
+                or value.body.args):
+            return False
+        target = value.body.func
+    else:
+        return False
+    if not (isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name)
+            and target.value.id == "exp"):
+        return False
+    try:
+        from sqlglot import exp
+    except ImportError:
+        return False
+    cls = vars(exp).get(target.attr)
+    if (type(cls) is not type or not issubclass(cls, exp.Func)
+            or any(getattr(cls, attr, None) is not getattr(exp.Expression, attr)
+                   for attr in ("__init__", "__new__", "__getattribute__", "__setattr__", "_set_parent"))):
+        return False
+    if bound:
+        method = next((vars(t)["from_arg_list"] for t in cls.__mro__ if "from_arg_list" in vars(t)), None)
+        return method is vars(exp.Func)["from_arg_list"] and type(method) is classmethod
+    argument = args.args[0].arg
+    if argument in {"dict", "exp", "seq_get"}:
+        return False
+    for kw in value.body.keywords:
+        v = kw.value
+        if kw.arg not in cls.arg_types:
+            return False
+        if isinstance(v, ast.Constant) and (v.value is None or type(v.value) is bool):
+            continue
+        if isinstance(v, ast.Name) and v.id == argument:
+            continue
+        if (isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "seq_get"
+                and len(v.args) == 2 and not v.keywords and isinstance(v.args[0], ast.Name)
+                and v.args[0].id == argument and isinstance(v.args[1], ast.Constant)
+                and type(v.args[1].value) is int):
+            continue
+        return False
+    return True
+
+
+def _grouped_function_edits(before, after):
+    if not isinstance(before, ast.Dict) or not isinstance(after, ast.Dict):
+        return None
+    def entries(node):
+        mapping = {}
+        for key, value in zip(node.keys, node.values):
+            group = _alias_group(value) if key is None else ()
+            if group:
+                keys, handler = group, value.args[1]
+            elif isinstance(key, ast.Constant) and type(key.value) is str:
+                keys, handler = (key.value,), value
+            elif key is None:
+                keys, handler = (("spread", ast.dump(value)),), value
+            else:
+                return None
+            for k in keys:
+                if k in mapping:
+                    return None
+                mapping[k] = (group, ast.dump(handler), handler)
+        return mapping
+    old, new = entries(before), entries(after)
+    if old is None or new is None:
+        return None
+    changed = {k for k in old.keys() | new.keys() if k not in old or k not in new or old[k][:2] != new[k][:2]}
+    if (not changed or any(type(k) is not str for k in changed)
+            or not any(index[k][0] for k in changed for index in (old, new) if k in index)
+            or [k for k in old if k not in changed] != [k for k in new if k not in changed]):
+        return None
+    for k in changed:
+        for index in (old, new):
+            if k in index and not _dispatch_handler(index[k][2]):
+                return None
+    return {"str:" + k for k in changed}, True
+
+
+_DUCKDB_PARSER = "43d5f72b9fc84a064e0f59855c33bc04ca113d606f2f5ad194c2b1e926889535"
+
+
+@cache
+def _opaque_dispatch_readers(source):
+    readers = set(expression_consumer_profile()["opaque"])
+    profiles = (
+        ("tests/test_executor.py", "270a844a7b0b84045efde017135e6208ca07d7d93eba395be17c20c6e918923d",
+         ("TestExecutor::test_execute_tpcds", "TestExecutor::test_execute_tpch")),
+        ("tests/test_generator.py", "3b3781e8219d97c80a882d5285bdf9824f306abf85c4cafb7e5dce7631243215",
+         ("TestGenerator::test_generator_memory",)),
+        ("tests/test_optimizer.py", "35c02d71cacfa5d8e24319ef245963da3c1151b891281bac1864a00fa183cbf7",
+         ("TestOptimizer::test_tpcds",)),
+    )
+    for file, digest, methods in profiles:
+        path = source / file
+        if path.is_file() and hashlib.sha256(path.read_text(encoding="utf-8").encode()).hexdigest() == digest:
+            readers.difference_update(f"{file}::{method}" for method in methods)
+    return readers
 
 
 def _observed(rows, cov, relevant=None):
@@ -406,6 +525,7 @@ def declaration_candidates(path, original, patched, old_lines, cov, *, single_ch
         return None
     changes = []
     changed_nodes = set()
+    grouped = False
     for (cls, attr, a), (cls2, attr2, b) in zip(left, right):
         if (cls, attr) != (cls2, attr2):
             return None
@@ -420,6 +540,12 @@ def declaration_candidates(path, original, patched, old_lines, cov, *, single_ch
         if not _literal_edits(before, after) or (isinstance(container, (ast.Dict, ast.Set)) and not keys):
             symbols = _lookup_index()[3]["symbols"]
             extended = _entry_edits(before, after, symbols)
+            if (extended is None and single_change and attr == "FUNCTIONS"
+                    and cls == "sqlglot.parsers.duckdb.DuckDBParser"
+                    and hashlib.sha256(original.encode()).hexdigest() == _DUCKDB_PARSER):
+                extended = _grouped_function_edits(before, after)
+                if extended is not None:
+                    grouped = True
             if extended is None and not (
                 isinstance(before, ast.Attribute) and isinstance(after, ast.Attribute)
                 and ast.dump(before.value) == ast.dump(after.value)
@@ -441,6 +567,10 @@ def declaration_candidates(path, original, patched, old_lines, cov, *, single_ch
 
     descendants, records, tests, cached, copies = _index()
     names = set(cov.nodes).difference(tests)
+    if grouped:
+        if len(changes) != 1:
+            return None
+        names.update(_opaque_dispatch_readers(Path(os.environ.get("SQLGLOT_ROOT", "/opt/sqlglot"))))
     hits = set()
     for cls, attr, keys, extended in changes:
         if cls == module and not extended:

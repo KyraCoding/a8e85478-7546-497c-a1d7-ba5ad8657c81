@@ -2,11 +2,17 @@ import gzip
 import hashlib
 import json
 import marshal
+from functools import cache
 from pathlib import Path
 
 
 MAPS = Path(__file__).resolve().parent / "maps"
 PACKED = MAPS.parent / "packed_maps"
+
+
+@cache
+def expression_consumer_profile():
+    return json.loads((MAPS.parent / "expression_consumers.json").read_bytes())
 
 
 def read_json_map(path):

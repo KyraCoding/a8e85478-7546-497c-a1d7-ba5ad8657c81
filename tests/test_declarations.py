@@ -5,7 +5,8 @@ import unittest
 from unittest.mock import patch
 
 from coverage_map import Coverage
-from declarations import _declaration_trees, _entry_edits, _private_transform_helper, declaration_candidates
+from declarations import (_declaration_trees, _entry_edits, _grouped_function_edits,
+                          _private_transform_helper, declaration_candidates)
 
 
 class DeclarationEditsTest(unittest.TestCase):
@@ -37,6 +38,28 @@ class DeclarationEditsTest(unittest.TestCase):
         ]:
             with self.subTest(new=new):
                 self.assertIsNone(self.edits(old, new))
+
+
+class GroupedFunctionTests(unittest.TestCase):
+    base = '{**Base.FUNCTIONS, "A": exp.ArrayDistinct.from_arg_list, "B": keep}'
+    fn = "lambda args: exp.ArrayDistinct(this=seq_get(args, 0), check_null=False)"
+    def edits(self, new):
+        return _grouped_function_edits(ast.parse(self.base, mode="eval").body,
+                                       ast.parse(new, mode="eval").body)
+
+    def test_pure_group_and_bound_method_replacement(self):
+        new = '{**Base.FUNCTIONS, **dict.fromkeys(("A", "C"), HANDLER), "B": keep}'
+        self.assertEqual(self.edits(new.replace("HANDLER", self.fn)), ({"str:A", "str:C"}, True))
+        for fn in [self.fn.replace("lambda args:", "lambda args=side_effect():"),
+                   self.fn.replace("args", "seq_get"), self.fn.replace("args", "exp"),
+                   "lambda args: side_effect(args)", "lambda args: exp.ArrayDistinct(this=mutate())"]:
+            with self.subTest(fn=fn):
+                self.assertIsNone(self.edits(new.replace("HANDLER", fn)))
+        for altered in [new.replace('"B": keep', '"B": lambda args: mutate(args)'),
+                        new.replace("**Base.FUNCTIONS, ", "").replace('"B": keep', '"B": keep, **Base.FUNCTIONS'),
+                        new.replace('"B": keep', '"B": keep, "C": keep')]:
+            with self.subTest(altered=altered):
+                self.assertIsNone(self.edits(altered.replace("HANDLER", self.fn)))
 
 
 class PrivateTransformHelperTest(unittest.TestCase):

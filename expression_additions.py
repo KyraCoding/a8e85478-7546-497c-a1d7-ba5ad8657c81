@@ -1,12 +1,11 @@
 """Consumers of new, class-keyed expressions in the pinned SQLGlot registry."""
 import ast
 import hashlib
-import json
 import re
-from functools import cache
 from pathlib import Path
 
 from declarations import _lookup_index
+from map_store import expression_consumer_profile
 from semantics import _dump_key
 
 
@@ -95,11 +94,6 @@ def _only_new_metadata(change, names):
     return bool(removed) and _dump_key(old) == _dump_key(new)
 
 
-@cache
-def _profile():
-    return json.loads(PROFILE.read_bytes())
-
-
 def _eligible(changes, profile):
     classes = [c for c in changes if c.path in profile["modules"]]
     types = [c for c in changes if c.path in profile["typing"]]
@@ -132,7 +126,7 @@ def refine_expression_additions(changes, chosen, cov, catalog):
     if not class_candidate:
         return chosen
     try:
-        profile = _profile()
+        profile = expression_consumer_profile()
         affected = _eligible(changes, profile)
         if not affected:
             return chosen
