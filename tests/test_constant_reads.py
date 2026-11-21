@@ -1,4 +1,4 @@
-"""Immutable class-constant reads in generator callbacks (Flint-52, fresh x23).
+"""Immutable class-constant reads in generator callbacks.
 
 Needs the pinned checkout at SQLGLOT_ROOT (default /opt/sqlglot).  Each case builds a real diff against it, as the
 selector would read it, and asks generator_initialization_changed about the Postgres generator file.
@@ -85,6 +85,9 @@ class ConstantReadTest(unittest.TestCase):
             "lookup hook": override("    def __getattr__(self, name):\n        return []\n\n"),
             "instance store": override(
                 "    def reset(self):\n        self.DATE_PART_WITH_EXPRESSION = []\n\n"),
+            "aliased base": [(REDSHIFT_ANCHOR,
+                             "from sqlglot.generators.postgres import PostgresGenerator as PG\n"
+                             "class RedshiftGenerator(PG):\n    DATE_PART_WITH_EXPRESSION = []\n")],
             "mutable subclass": [(REDSHIFT_ANCHOR,
                                   "class OtherGenerator(PostgresGenerator):\n"
                                   "    DATE_PART_WITH_EXPRESSION = []\n\n\n" + REDSHIFT_ANCHOR)],

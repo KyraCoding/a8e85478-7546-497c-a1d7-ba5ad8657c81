@@ -2,6 +2,7 @@ import ast
 import difflib
 import marshal
 import os
+import time
 from functools import lru_cache
 from importlib.util import MAGIC_NUMBER, cache_from_source
 from types import CodeType
@@ -218,6 +219,14 @@ def _immutable_literal(node):
 
 
 _PINNED_TEXT = {}
+
+
+def _class_topology(tree):
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            yield _dump_key(node)
+        elif isinstance(node, ast.ClassDef):
+            yield node.name, tuple(_dump_key(base) for base in (*node.bases, *node.keywords, *node.decorator_list))
 _PINNED_TREE = {}
 
 
@@ -227,6 +236,11 @@ class _Universe:
     def __init__(self, changes, root=None):
         self.root = root or os.environ.get("SQLGLOT_ROOT", "/opt/sqlglot")
         self.complete = not any(c.structural or not c.original or not c.patched for c in changes)
+        self.deadline = time.monotonic() + 2.5
+        if self.complete:
+            self.complete = all(tuple(_class_topology(_baseline(c.path, c.original)[0]))
+                                == tuple(_class_topology(patched_tree(c.path, c.patched)))
+                                for c in changes if c.path.endswith(".py"))
         self.overrides = {c.path: c.patched for c in changes if c.path.endswith(".py")}
         self.trees = {}
         self.files_read = 0
@@ -482,8 +496,12 @@ class _ConstantRead:
         while frontier:
             key = frontier.pop()
             for path in self.universe.mentioning(key[1]):
+                if time.monotonic() > self.universe.deadline:
+                    raise _Unproven("class scan budget reached")
                 tree = self.universe.tree(path)
                 for node in ast.walk(tree):
+                    if isinstance(node, ast.alias) and node.name == key[1] and node.asname:
+                        raise _Unproven(f"aliased class import in {path}")
                     if isinstance(node, ast.Call) and isinstance(node.func, (ast.Name, ast.Attribute)):
                         callee = node.func.id if isinstance(node.func, ast.Name) else node.func.attr
                         if callee == "new_class" or (callee == "type" and len(node.args) == 3):
@@ -505,11 +523,21 @@ class _ConstantRead:
     def _no_outside_writes(self, attr, defining):
         universe = self.universe
         for path in sorted(set(universe.mentioning(attr)) | defining | set(universe.overrides)):
+            if time.monotonic() > universe.deadline:
+                raise _Unproven("binding scan budget reached")
             if not path.startswith(_UNIVERSE_DIRS):
                 continue
             tree = universe.tree(path)
             strict = path in defining or path in universe.overrides
             for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef):
+                    for stmt in node.body:
+                        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name == attr:
+                            raise _Unproven(f"{attr} has a method or descriptor binding in {path}")
+                        if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+                            targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+                            if any(isinstance(t, ast.Name) and t.id == attr for t in targets) and not _immutable_literal(stmt.value):
+                                raise _Unproven(f"{attr} has a nonliteral class binding in {path}")
                 if isinstance(node, ast.Attribute) and node.attr == attr and isinstance(node.ctx, (ast.Store, ast.Del)):
                     raise _Unproven(f"{attr} assigned outside its class body in {path}")
                 if isinstance(node, ast.Attribute) and node.attr == "__dict__" and strict:
