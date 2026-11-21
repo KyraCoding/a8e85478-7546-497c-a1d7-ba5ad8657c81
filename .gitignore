@@ -4,3 +4,4 @@ __pycache__/
 .pytest_cache/
 crossagentchat/
 .private/
+ds_unread_baseline.json.gz

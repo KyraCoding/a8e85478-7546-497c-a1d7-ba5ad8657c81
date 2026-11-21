@@ -22,6 +22,8 @@ def _dump_key(node):
 
 
 _DEFINITIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+_DEFINITION_SCOPES = (*_DEFINITIONS, ast.If, ast.For, ast.AsyncFor, ast.While, ast.With,
+                      ast.AsyncWith, ast.Try, ast.TryStar, ast.ExceptHandler, ast.Match, ast.match_case)
 
 
 def _without_positions(code):
@@ -92,6 +94,148 @@ def _patched(path, source):
 
 def patched_tree(path, source):
     return _patched(path, source)[0]
+
+
+_MUTATING_CALLS = frozenset({
+    "setattr", "delattr", "exec", "eval", "__setattr__", "__delattr__", "__setitem__",
+    "__delitem__", "setdefault", "update", "add", "append", "extend", "insert", "remove",
+    "clear", "discard", "pop", "popitem", "register", "unregister", "reverse", "sort",
+})
+
+_REFLECTIVE_WRITES = {"setattr", "delattr", "__setattr__", "__delattr__", "__setitem__",
+                      "__delitem__", "exec", "eval"}
+
+
+def _shared_receiver(node, names):
+    while isinstance(node, (ast.Attribute, ast.Subscript)):
+        if isinstance(node, ast.Attribute) and (node.attr.isupper() or node.attr in {"__dict__", "arg_types"}):
+            return True
+        node = node.value
+    return isinstance(node, ast.Name) and node.id in names
+
+
+def _may_write_shared_state(scope, shared, writers):
+    nodes = list(ast.walk(scope))
+    aliases = set()
+    for node in nodes:
+        if isinstance(node, ast.Global):
+            return True
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            name = node.id if isinstance(node, ast.Name) else node.attr
+            if name in writers:
+                return True
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and _shared_receiver(node.value, shared):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            aliases.update(t.id for t in targets if isinstance(t, ast.Name))
+    roots = shared | aliases
+    for node in nodes:
+        if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            if _shared_receiver(node.value, roots):
+                return True
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Attribute) and node.func.attr in _MUTATING_CALLS:
+                if _shared_receiver(node.func.value, roots):
+                    return True
+            if any(isinstance(arg, ast.Name) and arg.id in aliases for arg in node.args):
+                return True
+    return False
+
+
+def _changed_shared_scopes(tree, lines):
+    shared = {alias.asname or alias.name.split(".")[0]
+              for stmt in tree.body if isinstance(stmt, (ast.Import, ast.ImportFrom)) for alias in stmt.names}
+    shared.update(stmt.name for stmt in tree.body if isinstance(stmt, ast.ClassDef))
+
+    def visit(scope, owner, writers):
+        writers = set(writers)
+        for stmt in scope.body:
+            if isinstance(stmt, ast.Assign) and isinstance(stmt.value, (ast.Name, ast.Attribute)):
+                name = stmt.value.id if isinstance(stmt.value, ast.Name) else stmt.value.attr
+                if name in writers:
+                    writers.update(t.id for t in stmt.targets if isinstance(t, ast.Name))
+        for stmt in scope.body:
+            first = min((d.lineno for d in getattr(stmt, "decorator_list", ())), default=stmt.lineno)
+            if lines and not any(first <= n <= stmt.end_lineno for n in lines):
+                continue
+            if isinstance(stmt, ast.ClassDef):
+                yield from visit(stmt, (*owner, stmt.name), writers)
+            elif _may_write_shared_state(stmt, shared, writers):
+                yield owner, _dump_key(stmt)
+
+    return tuple(visit(tree, (), _REFLECTIVE_WRITES))
+
+
+def _executed_effects(node):
+    if isinstance(node, ast.Lambda):
+        for default in (*node.args.defaults, *node.args.kw_defaults):
+            if default is not None:
+                yield from _executed_effects(default)
+        return
+    if isinstance(node, ast.Call):
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+        if name in _MUTATING_CALLS:
+            yield _dump_key(node)
+            return
+    if isinstance(node, (ast.AugAssign, ast.Delete)):
+        yield _dump_key(node)
+        return
+    if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, ast.Store):
+        yield _dump_key(node)
+    for child in ast.iter_child_nodes(node):
+        yield from _executed_effects(child)
+
+
+def _definition_effects(node, owner=()):
+    if isinstance(node, _DEFINITIONS):
+        owner = (*owner, node.name)
+        for position, decorator in enumerate(node.decorator_list):
+            yield owner, "decorator", position, _dump_key(decorator)
+        if isinstance(node, ast.ClassDef):
+            expressions = (*node.bases, *(keyword.value for keyword in node.keywords))
+        else:
+            args = node.args
+            parameters = (*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg)
+            expressions = (*args.defaults, *args.kw_defaults, node.returns,
+                           *(arg.annotation for arg in parameters if arg is not None))
+        for position, value in enumerate(expressions):
+            if value is not None and any(isinstance(n, ast.Call) for n in ast.walk(value)):
+                yield owner, "call", position, _dump_key(value)
+        if not isinstance(node, ast.ClassDef):
+            return
+    elif not isinstance(node, ast.Module):
+        # A surrounding condition can turn an unchanged initializer on or off.
+        owner = (*owner, _dump_key(node))
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.expr, ast.withitem, ast.comprehension)):
+                if isinstance(child, ast.Call):
+                    yield owner, "control", _dump_key(child)
+                else:
+                    for effect in _executed_effects(child):
+                        yield owner, "control", effect
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, _DEFINITION_SCOPES):
+            yield from _definition_effects(child, owner)
+        elif isinstance(child, ast.stmt):
+            if isinstance(child, (ast.Expr, ast.Assign, ast.AnnAssign)) and isinstance(child.value, ast.Call):
+                yield owner, "expression", _dump_key(child.value)
+            else:
+                for effect in _executed_effects(child):
+                    yield owner, "statement", effect
+
+
+def generator_initialization_changed(change):
+    if not change.path.startswith("sqlglot/generators/") or not change.path.endswith(".py"):
+        return False
+    original = _baseline(change.path, change.original)[0]
+    patched = patched_tree(change.path, change.patched)
+    if tuple(_definition_effects(original)) != tuple(_definition_effects(patched)):
+        return True
+    if change.removed or change.added:
+        old = _changed_shared_scopes(original, change.removed) if change.removed else ()
+        new = _changed_shared_scopes(patched, change.added) if change.added else ()
+        return old != new
+    return _changed_shared_scopes(original, ()) != _changed_shared_scopes(patched, ())
 
 
 def patched_code(path, source):

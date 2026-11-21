@@ -28,12 +28,14 @@ COPY registry_context.py registry_readers.json ./
 COPY expression_additions.py expression_consumers.json ./
 COPY fe_replay.py fe_fence.py fe_baseline.json.gz fe_consumer.json.gz fe_lines.json.gz ./
 COPY ds_verify.py ds_operations.py ds_origin.py ds_worker.py ds_sites.json.gz ./
-COPY fork_check.py import_state.py mn_reduced.py ./
+COPY ds_rows.py ds_unread.py ds_imports.py ds_reads.json.gz fe_modules.json.gz ./
+COPY fork_check.py import_state.py mn_reduced.py inert_files.py ./
 COPY maps/ ./maps/
 COPY --from=native /out/ ./
 RUN python map_store.py \
  && PYTHONHASHSEED=0 python import_state.py --record /opt/sqlglot \
  && PYTHONHASHSEED=0 python mn_reduced.py --record /opt/sqlglot \
  && python fork_check.py --closure /app/fork_closure.json \
+ && PYTHONHASHSEED=0 python ds_unread.py --record /app/ds_unread_baseline.json.gz \
  && python -m compileall -q -l /app
 CMD ["python", "/app/selector.py"]

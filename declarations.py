@@ -48,6 +48,49 @@ def _key(node):
     return None
 
 
+def _outside_dict(source, node):
+    lines = source.encode("utf-8").splitlines(keepends=True)
+    return (b"".join(lines[:node.lineno - 1]) + lines[node.lineno - 1][:node.col_offset],
+            lines[node.end_lineno - 1][node.end_col_offset:] + b"".join(lines[node.end_lineno:]))
+
+
+def expression_contract_narrowed(change, state=None):
+    if not change.path.startswith("sqlglot/expressions/") or not change.path.endswith(".py"):
+        return False
+    before, after = _declaration_trees(change.path, change.original, change.patched)
+    schemas = []
+    touched = set()
+    for tree, lines in ((before, change.removed), (after, change.added)):
+        entries = {}
+        for owner, name, statement in _declarations(tree, ""):
+            if name == "arg_types":
+                entries[owner] = statement.value
+                if any(statement.lineno <= line <= statement.end_lineno for line in lines):
+                    touched.add(owner)
+        schemas.append(entries)
+    old, new = schemas
+    for owner in touched.intersection(old):
+        try:
+            original = ast.literal_eval(old[owner])
+            updated = ast.literal_eval(new[owner])
+        except (KeyError, ValueError, TypeError):
+            return True
+        if not isinstance(original, dict) or not isinstance(updated, dict):
+            return True
+        if original.keys() - updated.keys() or any(required and not original.get(k) for k, required in updated.items()):
+            if (state is not None and len(state.changes) == 1 and not change.structural
+                    and isinstance(old[owner], ast.Dict) and isinstance(new[owner], ast.Dict)
+                    and all(type(k) is str and type(v) is bool for d in (original, updated) for k, v in d.items())
+                    and _outside_dict(change.original, old[owner]) == _outside_dict(change.patched, new[owner])):
+                prefix = change.path[:-3].replace("/", ".") + owner + "."
+                bindings = state.changed()
+                # Trust the declaration readers only when all cold imports succeeded and only this schema changed.
+                if bindings and set(bindings) <= {prefix + "arg_types", prefix + "required_args"}:
+                    continue
+            return True
+    return False
+
+
 @cache
 def _lookup_index():
     folder = Path(__file__).resolve().parent / "maps"
@@ -507,6 +550,641 @@ def _private_transform_helper(path, old, new, root, cov):
     return _lookup_candidates(cls, "TRANSFORMS", impacted, keys, True, module, cov)
 
 
+# Renderer migration: one generator class moves renderers between its TRANSFORMS table and public
+# `<key>_sql` methods. `generator._build_dispatch` copies TRANSFORMS, then fills every expression class
+# whose key names a public `_sql` method and is absent from the table, so only the dispatch entries of the
+# removed keys and of the new methods' classes can change. The declaration profile records each test's
+# lookups in that final dispatch table, absent keys included.
+#
+# One path reaches a method without that table: `transforms.preprocess` calls
+# `getattr(self, root.key + "_sql")` on the root its transforms return. Each transform used by an affected
+# generator must therefore be one audited below (AST digest of the pinned source), and none may return a
+# root of a migrated class. The value is the set of classes it can return other than its own argument.
+_RENDERER_TRANSFORMS = {
+    ("sqlglot/transforms.py", "eliminate_distinct_on"): ("c53660809a3fdfdd", {"Select"}),
+    ("sqlglot/transforms.py", "eliminate_qualify"): ("76e632f05e358214", {"Select"}),
+    ("sqlglot/transforms.py", "eliminate_semi_and_anti_joins"): ("5bceec839cfc035f", set()),
+    ("sqlglot/transforms.py", "eliminate_window_clause"): ("9594ed1aa85dfdcc", set()),
+    ("sqlglot/transforms.py", "unqualify_unnest"): ("61ba20fbf7b3ecbd", set()),
+    ("sqlglot/transforms.py", "unnest_generate_date_array_using_recursive_cte"): ("5d98aac2db3942dd", set()),
+    ("sqlglot/transforms.py", "add_within_group_for_percentiles"): ("fe1e12e1c2a3dd9e", {"WithinGroup"}),
+    ("sqlglot/transforms.py", "remove_unique_constraints"): ("5c75bac191573ecb", set()),
+    ("sqlglot/transforms.py", "ctas_with_tmp_tables_to_create_tmp_view"): ("27e7fa7d6c38f0ae", {"Create"}),
+    ("sqlglot/generators/sqlite.py", "_transform_create"): ("99e630d6b1c37e16", set()),
+    ("sqlglot/generators/sqlite.py", "_generated_to_auto_increment"): ("ff8e5eef66816037", set()),
+    ("sqlglot/generators/postgres.py", "_auto_increment_to_serial"): ("fca81908700c2c5f", set()),
+    ("sqlglot/generators/postgres.py", "_serial_to_generated"): ("dcfec37c3d7d5323", set()),
+}
+_EXPR_ROOT = "sqlglot.expressions.core.Expr"
+_CONNECTOR = "sqlglot.expressions.core.Connector"
+
+
+def _ast_digest(node):
+    import hashlib
+    return hashlib.sha256(ast.dump(node, include_attributes=False).encode()).hexdigest()[:16]
+
+
+def _future_annotations(tree):
+    return any(isinstance(stmt, ast.ImportFrom) and stmt.module == "__future__"
+               and any(alias.name == "annotations" for alias in stmt.names) for stmt in tree.body)
+
+
+def _exp_member(node):
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "exp":
+        return node.attr
+    return None
+
+
+def _inert_renderer(value):
+    """A removed table value whose evaluation at class creation had no effect besides building it."""
+    if isinstance(value, ast.Lambda):
+        return not (value.args.defaults or any(value.args.kw_defaults))
+    if isinstance(value, ast.Call):
+        return (isinstance(value.func, ast.Name) and value.func.id == "rename_func" and len(value.args) == 1
+                and not value.keywords and isinstance(value.args[0], ast.Constant)
+                and type(value.args[0].value) is str)
+    return False
+
+
+# A migrated renderer runs inside later, unrelated tests whenever a dialect renders its class, so its body must
+# not change process state those tests can observe. (Fircrest's timestamp-deferred control: a deferred
+# `Parser.FUNCTIONS.setdefault` inside a new `currenttimestamp_sql` made parser test 1527 fail after an earlier
+# Materialize test had rendered a timestamp.) Each added method body, and each removed table lambda whose calls
+# stop happening, must therefore fit a read-only grammar:
+#   statements   a leading docstring, `name = value` to a fresh local, `if`, `return`;
+#   values       str/int/float/bool/None constants, the parameters and locals, the read-only Expr accessors
+#                below on them, `exp.<expression class>`, `[<int>]` indexing, `and`/`or`/`not`, `==`, `!=`,
+#                `is`, `is not`, conditional expressions, list/tuple displays, f-strings of locals;
+#   calls        only `<generator>.func(...)` and `<generator>._jsonobject_sql(...)` (pinned in
+#                sqlglot/generator.py, which a single generator-module patch cannot override: added methods
+#                must be named `<key>_sql`), the builtins `len`, `isinstance` and `any`, and
+#                `<value>.args.get(<str>)` / `<value>.args.values()`; no keywords, `*` only into the helpers.
+# Anything else declines: another call (including mutators such as `setdefault`, `update`, `append`, `pop`),
+# attribute or item stores, `del`, `global`, imports, nested scopes, loops, `try`, walrus, lambdas, comprehensions.
+_PURE_ATTRS = frozenset({"this", "expression", "expressions", "args", "is_int"})
+_PURE_HELPERS = frozenset({"func", "_jsonobject_sql"})
+_PURE_BUILTINS = frozenset({"len", "isinstance", "any"})
+_PURE_COMPARE = (ast.Eq, ast.NotEq, ast.Is, ast.IsNot)
+
+
+def _pure_value(node, ctx):
+    kind = type(node)
+    if kind is ast.Constant:
+        return type(node.value) in (str, int, float, bool, type(None))
+    if kind is ast.Name:
+        return isinstance(node.ctx, ast.Load) and node.id in ctx["readable"]
+    if kind is ast.Attribute:
+        if not isinstance(node.ctx, ast.Load):
+            return False
+        if isinstance(node.value, ast.Name) and node.value.id == "exp":
+            return ctx["exp"] and node.attr in ctx["exp_classes"]
+        return node.attr in _PURE_ATTRS and _pure_value(node.value, ctx)
+    if kind is ast.Subscript:
+        # A list item only: `Expr.__getitem__` would build a Bracket instead of reading an element.
+        return (isinstance(node.ctx, ast.Load) and isinstance(node.slice, ast.Constant)
+                and type(node.slice.value) is int and _list_value(node.value, ctx))
+    if kind is ast.BoolOp:
+        return all(_pure_value(value, ctx) for value in node.values)
+    if kind is ast.UnaryOp:
+        return isinstance(node.op, ast.Not) and _pure_value(node.operand, ctx)
+    if kind is ast.Compare:
+        # `Expr.__eq__` hashes both trees and caches the hash on every node, so `==`/`!=` need a constant side.
+        operands = [node.left, *node.comparators]
+        for op, left, right in zip(node.ops, operands, operands[1:]):
+            if not isinstance(op, _PURE_COMPARE):
+                return False
+            if isinstance(op, (ast.Eq, ast.NotEq)) and not (isinstance(left, ast.Constant)
+                                                             or isinstance(right, ast.Constant)):
+                return False
+        return all(_pure_value(value, ctx) for value in operands)
+    if kind is ast.IfExp:
+        return all(_pure_value(value, ctx) for value in (node.test, node.body, node.orelse))
+    if kind in (ast.List, ast.Tuple):
+        return isinstance(node.ctx, ast.Load) and all(_pure_value(value, ctx) for value in node.elts)
+    if kind is ast.JoinedStr:
+        # Formatting an Expr would render it (`Expr.__str__` copies the tree and generates SQL); only str locals.
+        return all((isinstance(part, ast.Constant) and type(part.value) is str)
+                   or (isinstance(part, ast.FormattedValue) and part.conversion == -1 and part.format_spec is None
+                       and isinstance(part.value, ast.Name) and part.value.id in ctx["str_names"]
+                       and _pure_value(part.value, ctx))
+                   for part in node.values)
+    if kind is ast.Call:
+        return _pure_call(node, ctx)
+    return False
+
+
+def _list_value(node, ctx):
+    """A Python list: `<value>.expressions` or a local only ever bound to such a value or a list display."""
+    if isinstance(node, ast.Name):
+        return node.id in ctx["list_names"] and _pure_value(node, ctx)
+    return (isinstance(node, ast.Attribute) and node.attr == "expressions" and isinstance(node.ctx, ast.Load)
+            and _pure_value(node, ctx))
+
+
+def _typed_locals(body, generator):
+    """(str_names, list_names): locals every one of whose bindings is a str result, or a list, respectively."""
+    bindings = {}
+    for node in ast.walk(ast.Module(body=list(body), type_ignores=[])):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            bindings.setdefault(node.targets[0].id, []).append(node.value)
+
+    def is_str(value):
+        if isinstance(value, ast.Constant):
+            return type(value.value) is str
+        if isinstance(value, ast.JoinedStr):
+            return True
+        if isinstance(value, ast.IfExp):
+            return is_str(value.body) and is_str(value.orelse)
+        return (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
+                and isinstance(value.func.value, ast.Name) and value.func.value.id == generator
+                and value.func.attr in _PURE_HELPERS)
+
+    def is_list(value):
+        return (isinstance(value, (ast.List, ast.Tuple))
+                or (isinstance(value, ast.Attribute) and value.attr == "expressions"))
+
+    str_names = {name for name, values in bindings.items() if all(is_str(v) for v in values)}
+    list_names = {name for name, values in bindings.items() if all(is_list(v) for v in values)}
+    return str_names, list_names
+
+
+def _pure_call(node, ctx):
+    if node.keywords:
+        return False
+    func = node.func
+    if isinstance(func, ast.Name):
+        return (func.id in _PURE_BUILTINS and func.id not in ctx["shadowed"] and func.id not in ctx["readable"]
+                and all(not isinstance(arg, ast.Starred) and _pure_value(arg, ctx) for arg in node.args))
+    if not isinstance(func, ast.Attribute):
+        return False
+    owner = func.value
+    if isinstance(owner, ast.Name) and owner.id == ctx["generator"]:
+        if func.attr not in _PURE_HELPERS or not node.args:
+            return False
+        if func.attr == "func" and not (isinstance(node.args[0], ast.Constant) and type(node.args[0].value) is str):
+            return False
+        return all(_list_value(arg.value, ctx) if isinstance(arg, ast.Starred) else _pure_value(arg, ctx)
+                   for arg in node.args)
+    if (isinstance(owner, ast.Attribute) and owner.attr == "args" and isinstance(owner.ctx, ast.Load)
+            and _pure_value(owner.value, ctx)):
+        if func.attr == "values":
+            return not node.args
+        if func.attr == "get":
+            return (len(node.args) == 1 and isinstance(node.args[0], ast.Constant)
+                    and type(node.args[0].value) is str)
+    return False
+
+
+def _pure_block(body, ctx, docstring=False):
+    for index, stmt in enumerate(body):
+        if isinstance(stmt, ast.Expr):
+            if not (docstring and index == 0 and isinstance(stmt.value, ast.Constant)
+                    and type(stmt.value.value) is str):
+                return False
+        elif isinstance(stmt, ast.Assign):
+            if (len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name) or stmt.type_comment
+                    or stmt.targets[0].id in ctx["fixed"] or not _pure_value(stmt.value, ctx)):
+                return False
+            ctx["readable"].add(stmt.targets[0].id)
+        elif isinstance(stmt, ast.If):
+            if not (_pure_value(stmt.test, ctx) and _pure_block(stmt.body, ctx) and _pure_block(stmt.orelse, ctx)):
+                return False
+        elif isinstance(stmt, ast.Return):
+            if stmt.value is not None and not _pure_value(stmt.value, ctx):
+                return False
+        else:
+            return False
+    return True
+
+
+def _renderer_scope(tree, parents):
+    """Names a renderer body may rely on in this module, or None when the module rebinds them."""
+    bound = {}
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.setdefault(stmt.name, []).append(stmt)
+            continue
+        # Any other module-level statement, including nested `if`/`try` blocks: every name it can bind.
+        for node in ast.walk(stmt):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    if alias.name == "*":
+                        return None
+                    bound.setdefault(alias.asname or alias.name.split(".")[0], []).append(node)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                bound.setdefault(node.name, []).append(node)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                bound.setdefault(node.id, []).append(node)
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                return None
+    def imported_once(name, module):
+        found = bound.get(name, [])
+        return (len(found) == 1 and isinstance(found[0], ast.ImportFrom) and found[0].module == module
+                and not found[0].level and any(a.name == name and a.asname is None for a in found[0].names))
+
+    if not imported_once("exp", "sqlglot") or bound.keys() & _PURE_BUILTINS:
+        return None
+    classes = frozenset(owner.rsplit(".", 1)[-1] for owner, bases in parents.items() if _EXPR_ROOT in bases)
+    # The pinned `rename_func(name)` returns `lambda self, expression: self.func(name, *flatten(...))`.
+    return {"shadowed": frozenset(bound), "exp_classes": classes,
+            "rename_func": imported_once("rename_func", "sqlglot.dialects.dialect"),
+            "generator": imported_once("generator", "sqlglot")}
+
+
+def _pure_removed(value, scope):
+    if isinstance(value, ast.Lambda):
+        return _pure_lambda(value, scope)
+    return scope["rename_func"]  # `_inert_renderer` admits no other call than `rename_func("<str>")`
+
+
+_BASE_TABLE = ast.dump(ast.parse("generator.Generator.TRANSFORMS.items()", mode="eval").body)
+
+
+@cache
+def _base_transforms(root):
+    """Pinned `Generator.TRANSFORMS` entries written after its last `**` spread, with the module's scope."""
+    tree = ast.parse((root / "sqlglot/generator.py").read_bytes())
+    cls = next((s for s in tree.body if isinstance(s, ast.ClassDef) and s.name == "Generator"), None)
+    tables = [s.value for s in (cls.body if cls else ())
+              if (isinstance(s, ast.Assign) and len(s.targets) == 1 and isinstance(s.targets[0], ast.Name)
+                  and s.targets[0].id == "TRANSFORMS")
+              or (isinstance(s, ast.AnnAssign) and isinstance(s.target, ast.Name) and s.target.id == "TRANSFORMS")]
+    scope = _renderer_scope(tree, _parents())
+    if len(tables) != 1 or not isinstance(tables[0], ast.Dict) or scope is None:
+        return None
+    explicit = {}
+    for key, value in zip(tables[0].keys, tables[0].values):
+        if key is None:
+            explicit.clear()  # a spread may replace any entry written before it
+            continue
+        member = _exp_member(key)
+        if member is None:
+            return None
+        explicit[member] = value  # a later duplicate key wins in a dict display
+    return explicit, scope
+
+
+def _inherited_pure(table, member, root, module_scope):
+    """A key newly excluded from the inherited base table: its pinned renderer stops running too.
+
+    Only `generator.Generator.TRANSFORMS` is supported, and only for a key written explicitly after the base
+    table's last spread, so the inherited value is known.
+    """
+    if table != _BASE_TABLE or not module_scope["generator"]:
+        return False
+    base = _base_transforms(root)
+    if base is None:
+        return False
+    entries, scope = base
+    value = entries.get(member)
+    return value is not None and _inert_renderer(value) and _pure_removed(value, scope)
+
+
+def _pure_callable(params, body, scope, docstring=False):
+    """Whether a renderer with these parameter names (generator first) and body fits the read-only grammar."""
+    if len(set(params)) != len(params) or "exp" in params or _PURE_BUILTINS & set(params):
+        return False
+    generator = params[0] if params else None
+    fixed = set(params) | {"exp"} | _PURE_BUILTINS
+    str_names, list_names = _typed_locals(body, generator) if isinstance(body, list) else (set(), set())
+    ctx = {"generator": generator, "readable": set(params[1:]), "fixed": fixed, "exp": True,
+           "shadowed": scope["shadowed"] - {"exp"}, "exp_classes": scope["exp_classes"],
+           "str_names": str_names - fixed, "list_names": list_names - fixed}
+    if isinstance(body, list):
+        return _pure_block(body, ctx, docstring=docstring)
+    return _pure_value(body, ctx)
+
+
+def _pure_lambda(node, scope):
+    args = node.args
+    if args.posonlyargs or args.kwonlyargs or args.kwarg or args.defaults or any(args.kw_defaults):
+        return False
+    params = [arg.arg for arg in args.args]
+    if args.vararg is not None:
+        params.append(args.vararg.arg)
+    return _pure_callable(params, node.body, scope)
+
+
+def _expression_annotation(node, scope):
+    if node is None:
+        return True
+    if isinstance(node, ast.Constant) and type(node.value) is str:
+        try:
+            node = ast.parse(node.value, mode="eval").body
+        except SyntaxError:
+            return False
+    return (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "exp"
+            and node.attr in scope["exp_classes"])
+
+
+def _pure_method(method, scope):
+    """An added `<key>_sql(self, expression)` whose annotations and body fit the read-only grammar."""
+    first, second = method.args.args
+    returns = method.returns
+    if (first.annotation is not None or first.type_comment or second.type_comment or method.type_comment
+            or not _expression_annotation(second.annotation, scope)
+            or not (returns is None or (isinstance(returns, ast.Name) and returns.id == "str")
+                    or (isinstance(returns, ast.Constant) and returns.value == "str"))):
+        return False
+    return _pure_callable([first.arg, second.arg], method.body, scope, docstring=True)
+
+
+def _excluded_keys(comprehension):
+    """`{k: v for k, v in X.TRANSFORMS.items() if k != exp.A}` (or `not in (exp.A, ...)`): X and {A, ...}."""
+    if not (isinstance(comprehension, ast.DictComp) and len(comprehension.generators) == 1):
+        return None
+    gen = comprehension.generators[0]
+    if (gen.is_async or len(gen.ifs) != 1 or not isinstance(gen.target, ast.Tuple) or len(gen.target.elts) != 2
+            or not all(isinstance(e, ast.Name) for e in gen.target.elts)
+            or not isinstance(comprehension.key, ast.Name) or not isinstance(comprehension.value, ast.Name)
+            or comprehension.key.id != gen.target.elts[0].id or comprehension.value.id != gen.target.elts[1].id
+            or not (isinstance(gen.iter, ast.Call) and not gen.iter.args and not gen.iter.keywords
+                    and isinstance(gen.iter.func, ast.Attribute) and gen.iter.func.attr == "items")):
+        return None
+    cond = gen.ifs[0]
+    if not (isinstance(cond, ast.Compare) and len(cond.ops) == 1 and isinstance(cond.left, ast.Name)
+            and cond.left.id == comprehension.key.id):
+        return None
+    if isinstance(cond.ops[0], ast.NotEq):
+        members = [_exp_member(cond.comparators[0])]
+    elif isinstance(cond.ops[0], ast.NotIn) and isinstance(cond.comparators[0], (ast.Tuple, ast.Set, ast.List)):
+        members = [_exp_member(e) for e in cond.comparators[0].elts]
+    else:
+        return None
+    if None in members or len(set(members)) != len(members):
+        return None
+    return ast.dump(gen.iter), set(members)
+
+
+def _removed_pure(value, pure):
+    """A removed value (a default-free lambda or `rename_func("...")`) must also satisfy `pure` when given."""
+    return pure is None or pure(value)
+
+
+def _transform_table_edits(before, after, pure=None, inherited=None):
+    """Keys a TRANSFORMS dict display loses between two versions, or None for any other kind of edit.
+
+    With `pure`, every removed lambda must satisfy it; with `inherited`, every key newly excluded from an
+    inherited table must satisfy `inherited(iterated_table, key)`.
+    """
+    if not isinstance(before, ast.Dict) or not isinstance(after, ast.Dict):
+        return None
+    old = list(zip(before.keys, before.values))
+    new = list(zip(after.keys, after.values))
+    removed = set()
+    i = 0
+    for key, value in new:
+        while i < len(old):
+            okey, ovalue = old[i]
+            i += 1
+            if (key is None) != (okey is None):
+                if okey is None:
+                    return None
+            elif key is None:
+                if ast.dump(value) == ast.dump(ovalue):
+                    break
+                before_excl, after_excl = _excluded_keys(ovalue), _excluded_keys(value)
+                if before_excl is None or after_excl is None or before_excl[0] != after_excl[0]:
+                    return None
+                if not before_excl[1] <= after_excl[1]:
+                    return None
+                excluded = after_excl[1] - before_excl[1]
+                if inherited is not None and not all(inherited(after_excl[0], name) for name in excluded):
+                    return None
+                removed |= excluded
+                break
+            elif ast.dump(key) == ast.dump(okey):
+                if ast.dump(value) != ast.dump(ovalue):
+                    return None
+                break
+            member = _exp_member(okey)
+            if member is None or not _inert_renderer(ovalue) or not _removed_pure(ovalue, pure):
+                return None
+            removed.add(member)
+        else:
+            return None
+    for okey, ovalue in old[i:]:
+        member = _exp_member(okey)
+        if okey is None or member is None or not _inert_renderer(ovalue) or not _removed_pure(ovalue, pure):
+            return None
+        removed.add(member)
+    if any(_exp_member(k) is None for k in before.keys if k is not None):
+        return None
+    return removed
+
+
+def _added_renderers(old_cls, new_cls):
+    """New public `<key>_sql` methods and the class's TRANSFORMS pair, or None for any other class edit."""
+    names = {stmt.name for stmt in old_cls.body if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    added, table = [], None
+    remaining = list(old_cls.body)
+    for stmt in new_cls.body:
+        if isinstance(stmt, ast.FunctionDef) and stmt.name not in names:
+            args = stmt.args
+            if (stmt.decorator_list or getattr(stmt, "type_params", None) or args.posonlyargs or args.vararg
+                    or args.kwonlyargs or args.kwarg or args.defaults or len(args.args) != 2
+                    or not re.fullmatch(r"[a-z][a-z0-9]*_sql", stmt.name)):
+                return None
+            added.append(stmt)
+            continue
+        if not remaining:
+            return None
+        previous = remaining.pop(0)
+        if ast.dump(previous) == ast.dump(stmt):
+            continue
+        if (isinstance(stmt, ast.Assign) and isinstance(previous, ast.Assign) and len(stmt.targets) == 1
+                and len(previous.targets) == 1 and isinstance(stmt.targets[0], ast.Name)
+                and isinstance(previous.targets[0], ast.Name) and stmt.targets[0].id == "TRANSFORMS"
+                and previous.targets[0].id == "TRANSFORMS" and table is None):
+            table = previous.value, stmt.value
+            continue
+        return None
+    if remaining or not added:
+        return None
+    return added, table
+
+
+def _mentions(data, token, ignored_prefixes):
+    """Whether `token` occurs in `data` other than right after one of the ignored prefixes."""
+    start = data.find(token)
+    while start != -1:
+        if not any(data[max(0, start - len(p)):start] == p for p in ignored_prefixes):
+            return True
+        start = data.find(token, start + 1)
+    return False
+
+
+def _module_path(owner, root):
+    parts = owner.split(".")
+    for end in range(len(parts) - 1, 0, -1):
+        candidate = "/".join(parts[:end]) + ".py"
+        if (root / candidate).is_file():
+            return candidate
+    return None
+
+
+def _preprocess_transforms(tree):
+    """(name, reference) for every transform passed to `preprocess` in a module, None when unresolvable."""
+    local = {stmt.name for stmt in tree.body if isinstance(stmt, ast.FunctionDef)}
+    imported = {alias.asname or alias.name: alias.name for stmt in tree.body
+                if isinstance(stmt, ast.ImportFrom) and stmt.module == "sqlglot.transforms" for alias in stmt.names}
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        named = (isinstance(func, ast.Name) and (func.id == "preprocess" or imported.get(func.id) == "preprocess"))
+        if not (named or (isinstance(func, ast.Attribute) and func.attr == "preprocess")):
+            continue
+        if not node.args:
+            return None
+        if not isinstance(node.args[0], ast.List):
+            if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "self":
+                continue  # Generator.preprocess(expression), the generic pass, not a transform wrapper
+            return None
+        for item in node.args[0].elts:
+            if (isinstance(item, ast.Attribute) and isinstance(item.value, ast.Name)
+                    and item.value.id == "transforms"):
+                found.append(("sqlglot/transforms.py", item.attr))
+            elif isinstance(item, ast.Name) and item.id in local:
+                found.append((None, item.id))
+            elif isinstance(item, ast.Name) and item.id in imported:
+                found.append(("sqlglot/transforms.py", imported[item.id]))
+            else:
+                return None
+    return found
+
+
+def _renderer_migration(path, old, new, root, cov):
+    if not _future_annotations(old) or not _future_annotations(new) or len(old.body) != len(new.body):
+        return None
+    pair = None
+    for before, after in zip(old.body, new.body):
+        if ast.dump(before) == ast.dump(after):
+            continue
+        if (pair is not None or not isinstance(before, ast.ClassDef) or not isinstance(after, ast.ClassDef)
+                or before.name != after.name
+                or [ast.dump(b) for b in before.bases] != [ast.dump(b) for b in after.bases]
+                or [ast.dump(k) for k in before.keywords] != [ast.dump(k) for k in after.keywords]
+                or before.decorator_list or after.decorator_list
+                or getattr(before, "type_params", None) or getattr(after, "type_params", None)):
+            return None
+        pair = before, after
+    if pair is None:
+        return None
+    edit = _added_renderers(*pair)
+    if edit is None:
+        return None
+    added, table = edit
+    parents = _parents()
+    scope = _renderer_scope(new, parents)
+    if scope is None or not all(_pure_method(method, scope) for method in added):
+        return None
+    removed = set()
+    if table is not None:
+        removed = _transform_table_edits(
+            *table, pure=lambda value: _pure_removed(value, scope),
+            inherited=lambda iterated, member: _inherited_pure(iterated, member, root, scope))
+        if removed is None:
+            return None
+    module = path[:-3].replace("/", ".")
+    cls = f"{module}.{pair[1].name}"
+    descendants, _, _, _, copies = _index()
+    if cls not in descendants:
+        return None
+    classes = set(removed)
+    for method in added:
+        key = method.name[:-4]
+        matches = [o for o, bases in parents.items() if _EXPR_ROOT in bases and o.rsplit(".", 1)[-1].lower() == key]
+        if len(matches) != 1:
+            return None
+        classes.add(matches[0].rsplit(".", 1)[-1])
+    for name in classes:
+        owners = [o for o, bases in parents.items() if _EXPR_ROOT in bases and o.rsplit(".", 1)[-1] == name]
+        if len(owners) != 1 or _CONNECTOR in parents[owners[0]]:
+            return None
+    impacted = set(descendants.get(cls, {cls}))
+    pending = list(impacted)
+    while pending:
+        for target in copies.get((pending.pop(), "TRANSFORMS"), ()):
+            extra = descendants[target] - impacted
+            impacted.update(extra)
+            pending.extend(extra)
+    # Every module that contributes TRANSFORMS entries to an affected generator.
+    contributors = set()
+    for owner in impacted:
+        for base in parents.get(owner, (owner,)):
+            if _EXPR_ROOT not in parents.get(base, ()):
+                contributors.add(base)
+    trees = {path: new}
+    transforms_tree = None
+    for owner in sorted(contributors):
+        rel = _module_path(owner, root)
+        if rel is None:
+            return None
+        tree = trees.get(rel)
+        if tree is None:
+            data = (root / rel).read_bytes()
+            if not _mentions(data, b"preprocess(", (b"def ", b"self.")):
+                continue  # only its own definition or the generic `self.preprocess(expression)` pass
+            tree = trees[rel] = ast.parse(data)
+        refs = _preprocess_transforms(tree)
+        if refs is None:
+            return None
+        for source, name in refs:
+            source = source or rel
+            if source == "sqlglot/transforms.py":
+                if transforms_tree is None:
+                    transforms_tree = ast.parse((root / source).read_bytes())
+                defining = transforms_tree
+            else:
+                defining = trees.get(source)
+                if defining is None:
+                    defining = trees[source] = ast.parse((root / source).read_bytes())
+            func = next((s for s in defining.body if isinstance(s, ast.FunctionDef) and s.name == name), None)
+            audited = _RENDERER_TRANSFORMS.get((source, name))
+            if func is None or audited is None or _ast_digest(func) != audited[0] or audited[1] & classes:
+                return None
+    # Class reads of the changed table outside the affected generators, and direct callers of new methods.
+    names = {method.name for method in added}
+    class_read = re.compile(rb"\b" + re.escape(pair[1].name.encode()) + rb"\s*\.\s*TRANSFORMS\b")
+    callers = set()
+    for folder in ("sqlglot", "tests"):
+        for file in sorted((root / folder).rglob("*.py")):
+            rel = file.relative_to(root).as_posix()
+            data = file.read_bytes()
+            if not (class_read.search(data) or any(_mentions(data, n.encode(), (b"def ",)) for n in names)):
+                continue  # neither reads the class's table nor uses a new name other than defining it
+            tree = new if rel == path else ast.parse(data)
+            if rel != path:
+                prefix = rel[:-3].replace("/", ".")
+                allowed = {id(n) for stmt in tree.body if isinstance(stmt, ast.ClassDef)
+                           and f"{prefix}.{stmt.name}" in impacted for n in ast.walk(stmt)}
+                if any(isinstance(n, ast.Attribute) and n.attr == "TRANSFORMS" and isinstance(n.value, ast.Name)
+                       and n.value.id == pair[1].name and id(n) not in allowed for n in ast.walk(tree)):
+                    return None
+            for node in ast.walk(tree):
+                referenced = ((isinstance(node, ast.Attribute) and node.attr in names)
+                              or (isinstance(node, ast.Name) and node.id in names)
+                              or (isinstance(node, ast.Constant) and node.value in names))
+                if referenced:
+                    if not cov.present(rel):
+                        return None
+                    callers.update(cov.lines(rel, {node.lineno}))
+    result = _lookup_candidates(cls, "TRANSFORMS", impacted, {"member:" + n for n in classes}, True, module, cov)
+    if result is None:
+        return None
+    return result | callers
+
+
+@cache
+def _parents():
+    path = Path(__file__).resolve().parent / "maps" / "declarations.json.gz"
+    grouped = read_grouped(path)
+    data = grouped[0] if grouped is not None else read_map(path)
+    return {child: frozenset(bases) for child, bases in data["parents"].items()}
+
+
 def declaration_candidates(path, original, patched, old_lines, cov, *, single_change=False):
     if not path.startswith("sqlglot/"):
         return None
@@ -516,6 +1194,10 @@ def declaration_candidates(path, original, patched, old_lines, cov, *, single_ch
         result = _private_transform_helper(
             path, old, ast.parse(patched), Path(os.environ.get("SQLGLOT_ROOT", "/opt/sqlglot")), cov
         )
+        if isinstance(result, set):
+            return result | cov.missing
+    if single_change and path.startswith("sqlglot/generators/") and len(new.body) == len(old.body):
+        result = _renderer_migration(path, old, new, Path(os.environ.get("SQLGLOT_ROOT", "/opt/sqlglot")), cov)
         if isinstance(result, set):
             return result | cov.missing
     module = path[:-3].replace("/", ".").removesuffix(".__init__")

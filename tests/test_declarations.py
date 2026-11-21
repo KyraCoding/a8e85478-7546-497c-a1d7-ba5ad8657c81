@@ -2,14 +2,44 @@ import ast
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from coverage_map import Coverage
 from declarations import (_declaration_trees, _entry_edits, _grouped_function_edits,
-                          _private_transform_helper, declaration_candidates)
+                          _private_transform_helper, declaration_candidates, expression_contract_narrowed)
+from patches import Change
 
 
 class DeclarationEditsTest(unittest.TestCase):
+    def test_tightened_constructor_schema(self):
+        source = "class Expr:\n    arg_types = {'a': True, 'b': False}\n"
+        for updated, narrowed in ((source.replace(", 'b': False", ""), True),
+                                  (source.replace("False", "True"), True),
+                                  (source.replace("True", "False"), False),
+                                  (source.replace("}", ", 'c': False}"), False)):
+            with self.subTest(updated=updated):
+                change = Change("sqlglot/expressions/example.py", source, updated, {2}, {2})
+                self.assertEqual(expression_contract_narrowed(change), narrowed)
+
+    def test_clean_import_for_isolated_schema(self):
+        path = "sqlglot/expressions/sample.py"
+        old = "class Expr:\n    arg_types = {\n        'x': False,\n    }\n"
+        new = old.replace("False", "True")
+        change = Change(path, old, new, {3}, {3})
+        state = Mock(changes=[change])
+        key = "sqlglot.expressions.sample.Expr.arg_types"
+        state.changed.return_value = [key]
+        self.assertFalse(expression_contract_narrowed(change, state))
+        for bindings in (None, [], [key, "sqlglot.dialects.shared"]):
+            state.changed.return_value = bindings
+            self.assertTrue(expression_contract_narrowed(change, state))
+        state.changed.return_value = [key]
+        change.patched += "also_changed = True\n"
+        self.assertTrue(expression_contract_narrowed(change, state))
+        change.patched = new
+        state.changes = [change, change]
+        self.assertTrue(expression_contract_narrowed(change, state))
+
     def edits(self, old, new):
         def expr(text):
             return ast.parse(text, mode="eval").body
