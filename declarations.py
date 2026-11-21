@@ -1,4 +1,5 @@
 import ast
+import copy
 import os
 import re
 from collections import defaultdict
@@ -6,6 +7,7 @@ from functools import cache
 from pathlib import Path
 
 from map_store import read_map
+from semantics import _baseline, patched_tree
 
 
 @cache
@@ -243,16 +245,42 @@ def _module_references(root, attr):
     return refs or None
 
 
+def _declaration_trees(path, original, patched):
+    for text in (original, patched):
+        if text.startswith("\ufeff") or any("coding" in line for line in text.split("\n", 2)[:2]):
+            break
+    else:
+        try:
+            return _baseline(path, original)[0], patched_tree(path, patched)
+        except (SyntaxError, ValueError, RecursionError, OverflowError):
+            pass
+    return ast.parse(original), ast.parse(patched)
+
+
+def _mask_values(scope, changed):
+    result = copy.copy(scope)
+    result.body = []
+    for stmt in scope.body:
+        if stmt in changed:
+            stmt = copy.copy(stmt)
+            stmt.value = ast.Constant(None)
+        elif isinstance(stmt, ast.ClassDef):
+            stmt = _mask_values(stmt, changed)
+        result.body.append(stmt)
+    return result
+
+
 def declaration_candidates(path, original, patched, old_lines, cov):
     if not path.startswith("sqlglot/"):
         return None
-    old, new = ast.parse(original), ast.parse(patched)
+    old, new = _declaration_trees(path, original, patched)
     module = path[:-3].replace("/", ".").removesuffix(".__init__")
     left = list(_declarations(old, module))
     right = list(_declarations(new, module))
     if len(left) != len(right):
         return None
     changes = []
+    changed_nodes = set()
     for (cls, attr, a), (cls2, attr2, b) in zip(left, right):
         if (cls, attr) != (cls2, attr2):
             return None
@@ -282,8 +310,8 @@ def declaration_candidates(path, original, patched, old_lines, cov):
             ):
                 return None
         changes.append((cls, attr, keys, extended))
-        a.value = b.value = ast.Constant(None)
-    if not changes or ast.dump(old) != ast.dump(new):
+        changed_nodes.update((a, b))
+    if not changes or ast.dump(_mask_values(old, changed_nodes)) != ast.dump(_mask_values(new, changed_nodes)):
         return None
 
     descendants, records, tests, cached, copies = _index()
